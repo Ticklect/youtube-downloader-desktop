@@ -359,25 +359,55 @@ try {
     }
     $isolatedLocalAppData = Join-Path $stage 'isolated-localappdata'
     New-Item -ItemType Directory -Path $isolatedLocalAppData | Out-Null
-    $previousLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $isolatedLocalAppData, 'Process')
-        for ($run = 1; $run -le 2; $run++) {
-            $verificationOutput = @(& $stagedExe --verify-embedded-runtime 2>&1)
-            $verifyExitCode = $LASTEXITCODE
-            if ($verifyExitCode -ne 0) {
-                $preserveStageOnFailure = $true
-                $details = ($verificationOutput | Out-String).Trim()
-                throw "Standalone embedded-runtime verification run $run failed with exit code $verifyExitCode. $details"
+    for ($run = 1; $run -le 2; $run++) {
+        # Start the GUI-subsystem EXE through Process so the real child exit
+        # code is observed reliably; $LASTEXITCODE can be stale for GUI apps.
+        # Set LOCALAPPDATA on this child explicitly instead of mutating the
+        # packaging shell's environment.
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $stagedExe
+        $startInfo.Arguments = '--verify-embedded-runtime'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.Environment['LOCALAPPDATA'] = $isolatedLocalAppData
+
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        try {
+            if (-not $process.Start()) {
+                throw "Unable to start standalone embedded-runtime verification run $run."
             }
-            Assert-ExtractedRuntimeMatches $isolatedLocalAppData $verifiedBin
-            Write-Host "Embedded runtime verification run $run passed."
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(120000)) {
+                try { $process.Kill($true) } catch { $process.Kill() }
+                $process.WaitForExit()
+                throw "Standalone embedded-runtime verification run $run timed out after 120 seconds."
+            }
+            $process.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+            $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+            if ($stdout) { Write-Host "Runtime verifier stdout: $stdout" }
+            if ($stderr) { Write-Host "Runtime verifier stderr: $stderr" }
+            if ($process.ExitCode -ne 0) {
+                throw "Standalone embedded-runtime verification run $run failed with exit code $($process.ExitCode)."
+            }
+        } catch {
+            $preserveStageOnFailure = $true
+            throw
+        } finally {
+            $process.Dispose()
         }
-    } catch {
-        $preserveStageOnFailure = $true
-        throw
-    } finally {
-        [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $previousLocalAppData, 'Process')
+
+        try {
+            Assert-ExtractedRuntimeMatches $isolatedLocalAppData $verifiedBin
+        } catch {
+            $preserveStageOnFailure = $true
+            throw "Runtime self-test run $run exited successfully but extracted files did not match the verified inputs: $($_.Exception.Message)"
+        }
+        Write-Host "Embedded runtime verification run $run passed."
     }
 
     # Move the notices first and the EXE last. The EXE is the final success
