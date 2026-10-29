@@ -63,6 +63,7 @@ component KeyboardTarget {
 
 component ControlButton inherits Rectangle {
     in property <string> label: "";
+    in property <bool> left-aligned: false;
     in property <length> min-button-width: 58px;
     in property <bool> enabled: true;
     in property <bool> selected: false;
@@ -87,13 +88,13 @@ component ControlButton inherits Rectangle {
     background: !root.enabled ? #252527 : (root.primary || root.selected) ? root.accent : area.has-hover ? #323337 : root.surface;
     Text {
         text: root.label;
-        x: 5px;
-        width: parent.width - 10px;
+        x: root.left-aligned ? 10px : 5px;
+        width: parent.width - (root.left-aligned ? 20px : 10px);
         overflow: elide;
         color: !root.enabled ? #77797d : (root.primary || root.selected) ? root.accent-ink : root.text-color;
         font-size: 13px;
         font-weight: root.primary ? 700 : 600;
-        horizontal-alignment: center;
+        horizontal-alignment: root.left-aligned ? left : center;
         vertical-alignment: center;
     }
     area := KeyboardTarget {
@@ -107,6 +108,7 @@ component ControlButton inherits Rectangle {
 export component MainWindow inherits Window {
     title: "YouTube Downloader Desktop — Beta";
     icon: @image-url("../assets/app-icon.png");
+    no-frame: true;
     min-width: 880px;
     min-height: 625px;
     max-width: 10000px;
@@ -172,6 +174,8 @@ export component MainWindow inherits Window {
     in property <[ChannelRow]> recommended-channels;
 
     callback change-theme(string);
+    callback minimize-window();
+    callback close-window();
     callback toggle-fullscreen();
     callback toggle-maximize();
     callback load-channel();
@@ -196,39 +200,79 @@ export component MainWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
         Rectangle {
-            height: 46px;
-            background: root.canvas;
+            height: 50px;
+            background: root.mono ? #1b1b1b : #17181b;
+            // Slint asks Windows to move the window after a real drag. Clicks
+            // on the navigation tabs and window controls still reach them.
+            WindowMoveArea {
+                width: parent.width;
+                height: parent.height;
+            }
             HorizontalLayout {
-                width: min(parent.width, 1420px);
-                x: (parent.width - self.width) / 2;
-                padding-left: 40px; padding-right: 40px;
-                spacing: 28px;
-                for tab in [
-                    { name: "Library", page: "discover" },
-                    { name: "Download options", page: "setup" },
-                    { name: "Downloads", page: "queue" }
-                ]: Rectangle {
-                    width: tab.page == "setup" ? 172px : 130px;
-                    background: transparent;
-                    HorizontalLayout {
-                        spacing: 0px;
-                        Text { text: tab.name; color: root.page == tab.page ? root.ink : root.muted; font-size: 14px; font-weight: root.page == tab.page ? 700 : 500; vertical-alignment: center; }
-                    }
+                    padding-left: 17px;
+                    padding-right: 9px;
+                    spacing: 16px;
                     Rectangle {
-                        y: parent.height - 3px;
-                        height: 3px;
-                        background: root.page == tab.page ? root.accent : tab-hit.has-focus ? root.muted : transparent;
+                        width: 31px;
+                        height: 50px;
+                        background: transparent;
+                        Image {
+                            source: @image-url("../assets/app-icon.png");
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 24px;
+                            height: 24px;
+                            image-fit: contain;
+                        }
                     }
-                    accessible-role: button;
-                    accessible-label: tab.name;
-                    accessible-action-default => { root.page = tab.page; }
-                    tab-hit := KeyboardTarget {
-                        width: parent.width; height: parent.height;
-                        clicked => { root.page = tab.page; }
+                    for tab in [
+                        { name: "Library", page: "discover" },
+                        { name: "Download options", page: "setup" },
+                        { name: "Downloads", page: "queue" }
+                    ]: Rectangle {
+                        width: tab.page == "setup" ? 151px : 104px;
+                        height: 50px;
+                        background: transparent;
+                        Text { text: tab.name; color: root.page == tab.page ? root.ink : root.muted; font-size: 13px; font-weight: root.page == tab.page ? 700 : 500; vertical-alignment: center; }
+                        Rectangle {
+                            y: parent.height - 3px;
+                            height: 3px;
+                            background: root.page == tab.page ? root.accent : tab-hit.has-focus ? root.muted : transparent;
+                        }
+                        accessible-role: button;
+                        accessible-label: tab.name;
+                        accessible-action-default => { root.page = tab.page; }
+                        tab-hit := KeyboardTarget {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.page = tab.page; }
+                        }
                     }
-                }
-                Rectangle { horizontal-stretch: 1; background: transparent; }
-                Text { text: root.channel-name == "No channel loaded" ? "" : root.channel-name; color: root.muted; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; height: 50px; background: transparent; }
+                    Rectangle { width: 1px; height: 28px; background: root.edge; }
+                    ControlButton {
+                        width: 37px; min-button-width: 37px; height: 33px;
+                        label: "−";
+                        accessible-label: "Minimize window";
+                        surface: transparent; border: transparent;
+                        accent: root.accent; accent-ink: root.accent-ink; text-color: root.ink;
+                        clicked => { root.minimize-window(); }
+                    }
+                    ControlButton {
+                        width: 37px; min-button-width: 37px; height: 33px;
+                        label: root.maximized-active ? "❐" : "□";
+                        accessible-label: root.maximized-active ? "Restore window" : "Maximize window";
+                        surface: transparent; border: transparent;
+                        accent: root.accent; accent-ink: root.accent-ink; text-color: root.ink;
+                        clicked => { root.toggle-maximize(); }
+                    }
+                    ControlButton {
+                        width: 37px; min-button-width: 37px; height: 33px;
+                        label: "×";
+                        accessible-label: "Close window";
+                        surface: transparent; border: transparent;
+                        accent: root.accent; accent-ink: root.accent-ink; text-color: root.ink;
+                        clicked => { root.close-window(); }
+                    }
             }
         }
         Rectangle { height: 1px; background: root.edge; }
@@ -282,85 +326,103 @@ export component MainWindow inherits Window {
                             clicked => { root.load-channel(); }
                         }
                     }
-                    Rectangle {
-                        height: 47px;
-                        background: transparent;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                        height: 56px;
+                        horizontal-stretch: 1;
+                        background: root.mono ? #1e1e1e : #18191c;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: root.edge;
                         HorizontalLayout {
-                            spacing: 10px;
+                            padding-left: 12px;
+                            padding-right: 8px;
+                            spacing: 12px;
                             Text {
-                                width: 55px;
+                                width: 61px;
                                 text: "SAVED";
                                 color: root.faded;
-                                font-size: 12px;
+                                font-size: 11px;
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
                             if root.saved-channels.length == 0: Text {
-                                text: "No saved channels yet";
+                                text: "Pin channels for quick access";
                                 color: root.muted;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                             }
-                            if root.saved-channels.length > 0: ScrollView {
-                                height: 47px;
+                            if root.saved-channels.length > 0: Rectangle {
+                                height: 56px;
                                 horizontal-stretch: 1;
-                                horizontal-scrollbar-policy: as-needed;
-                                vertical-scrollbar-policy: always-off;
-                                content-width: root.saved-channels.length * 196px;
-                                content-height: 36px;
-                                HorizontalLayout {
-                                    width: root.saved-channels.length * 196px;
-                                    height: 34px;
-                                    spacing: 6px;
-                                    for channel in root.saved-channels: Rectangle {
-                                        width: 190px;
-                                        height: 34px;
-                                        background: root.field;
-                                        border-width: 1px;
-                                        border-color: root.edge;
-                                        border-radius: 6px;
-                                        HorizontalLayout {
-                                            padding-left: 2px;
-                                            padding-right: 2px;
-                                            spacing: 2px;
-                                            ControlButton {
-                                                horizontal-stretch: 1;
-                                                height: 30px;
-                                                label: channel.name;
-                                                enabled: !root.loading;
-                                                border: root.field;
-                                                surface: root.field;
-                                                accent: root.accent;
-                                                accent-ink: root.accent-ink;
-                                                text-color: root.ink;
-                                                clicked => { root.open-saved-channel(channel.url); }
-                                                Tooltip { text: @markdown("Open \{channel.url}"); }
-                                            }
-                                            ControlButton {
-                                                width: 30px;
-                                                min-button-width: 28px;
-                                                height: 30px;
-                                                label: "×";
-                                                accessible-label: "Remove " + channel.name + " from saved channels";
-                                                border: root.field;
-                                                surface: root.field;
-                                                accent: root.accent;
-                                                accent-ink: root.accent-ink;
-                                                text-color: root.muted;
-                                                clicked => { root.remove-saved-channel(channel.url); }
+                                background: transparent;
+                                ScrollView {
+                                    width: parent.width;
+                                    height: 40px;
+                                    y: (parent.height - self.height) / 2;
+                                    horizontal-scrollbar-policy: as-needed;
+                                    vertical-scrollbar-policy: always-off;
+                                    content-width: root.saved-channels.length * 233px;
+                                    content-height: 40px;
+                                    HorizontalLayout {
+                                        width: root.saved-channels.length * 233px;
+                                        height: 40px;
+                                        spacing: 7px;
+                                        for channel in root.saved-channels: Rectangle {
+                                            width: 226px;
+                                            height: 36px;
+                                            background: channel.url == root.channel-url ? (root.mono ? #333333 : #2b2b30) : (root.mono ? #292929 : #232428);
+                                            border-width: 1px;
+                                            border-color: channel.url == root.channel-url ? (root.mono ? #666666 : #53545d) : root.edge;
+                                            border-radius: 7px;
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                padding-right: 4px;
+                                                spacing: 2px;
+                                                ControlButton {
+                                                    horizontal-stretch: 1;
+                                                    min-button-width: 0px;
+                                                    height: 32px;
+                                                    label: channel.name;
+                                                    left-aligned: true;
+                                                    enabled: !root.loading;
+                                                    border: transparent;
+                                                    surface: transparent;
+                                                    accent: root.accent;
+                                                    accent-ink: root.accent-ink;
+                                                    text-color: root.ink;
+                                                    clicked => { root.open-saved-channel(channel.url); }
+                                                    Tooltip { text: @markdown("Open \{channel.url}"); }
+                                                }
+                                                ControlButton {
+                                                    width: 28px;
+                                                    min-button-width: 28px;
+                                                    height: 28px;
+                                                    label: "×";
+                                                    accessible-label: "Remove " + channel.name + " from saved channels";
+                                                    border: transparent;
+                                                    surface: transparent;
+                                                    accent: root.accent;
+                                                    accent-ink: root.accent-ink;
+                                                    text-color: root.muted;
+                                                    clicked => { root.remove-saved-channel(channel.url); }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                        }
+                    }
                             Rectangle {
-                                width: 158px;
-                                height: 47px;
+                                width: 152px;
+                                height: 56px;
                                 background: transparent;
                                 ControlButton {
                                     width: parent.width;
-                                    height: 34px;
+                                    height: 37px;
                                     y: (parent.height - self.height) / 2;
                                     label: "From your searches";
                                     accent: root.accent;
@@ -371,8 +433,8 @@ export component MainWindow inherits Window {
                                     clicked => { channel-suggestions.show(); }
                                 }
                                 channel-suggestions := PopupWindow {
-                                    x: -282px;
-                                    y: 48px;
+                                    x: parent.width - self.width;
+                                    y: parent.height + 4px;
                                     width: 440px;
                                     height: 277px;
                                     close-policy: close-on-click-outside;
@@ -464,7 +526,6 @@ export component MainWindow inherits Window {
                                     }
                                 }
                             }
-                        }
                     }
                     if root.channel-error != "": Rectangle {
                         height: 46px;

@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,37 +118,107 @@ pub fn parse_channel_json(text: &str) -> Result<(String, Vec<Video>), String> {
     parse_channel_page_json(text, false)
 }
 
+#[derive(Deserialize)]
+struct ChannelMetadata {
+    #[serde(default)]
+    channel: Value,
+    #[serde(default)]
+    title: Value,
+    #[serde(default)]
+    entries: Option<Vec<ChannelMetadataEntry>>,
+}
+
+#[derive(Default, Deserialize)]
+struct ChannelMetadataFields {
+    #[serde(default)]
+    id: Value,
+    #[serde(default)]
+    title: Value,
+    #[serde(default)]
+    duration: Value,
+    #[serde(default)]
+    upload_date: Value,
+}
+
+#[derive(Default)]
+struct ChannelMetadataEntry(ChannelMetadataFields);
+
+impl<'de> Deserialize<'de> for ChannelMetadataEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = ChannelMetadataEntry;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a yt-dlp playlist entry or an unusable JSON value")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                ChannelMetadataFields::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    map,
+                ))
+                .map(ChannelMetadataEntry)
+            }
+            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ChannelMetadataEntry::default())
+            }
+        }
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
 fn parse_channel_page_json(text: &str, allow_empty: bool) -> Result<(String, Vec<Video>), String> {
     if text.len() > 12_000_000 {
         return Err("Channel metadata is unexpectedly large.".into());
     }
-    let document: Value = serde_json::from_str(text)
+    let document: ChannelMetadata = serde_json::from_str(text)
         .map_err(|_| "yt-dlp returned unreadable channel metadata.".to_owned())?;
-    let name = document["channel"]
+    let name = document
+        .channel
         .as_str()
-        .or(document["title"].as_str())
+        .or(document.title.as_str())
         .unwrap_or("YouTube channel");
-    let entries = document["entries"]
-        .as_array()
+    let entries = document
+        .entries
+        .as_deref()
         .ok_or("yt-dlp did not return a channel video list.")?;
     let mut found = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in entries.iter().take(CHANNEL_PAGE_SIZE * 2) {
-        let id = entry["id"].as_str().unwrap_or("");
+        let entry = &entry.0;
+        let id = entry.id.as_str().unwrap_or("");
         if !validate_id(id) || !seen.insert(id.to_owned()) {
             continue;
         }
-        let title = entry["title"].as_str().unwrap_or("Untitled video");
+        let title = entry.title.as_str().unwrap_or("Untitled video");
         let title: String = title
             .chars()
             .filter(|ch| !ch.is_control())
             .take(200)
             .collect();
-        let seconds = entry["duration"].as_u64();
+        let seconds = entry.duration.as_u64();
         let duration = seconds
             .map(|s| format!("{}:{:02}", s / 60, s % 60))
             .unwrap_or_else(|| "Duration unknown".into());
-        let uploaded = entry["upload_date"]
+        let uploaded = entry
+            .upload_date
             .as_str()
             .filter(|date| date.len() == 8 && date.bytes().all(|c| c.is_ascii_digit()))
             .map(|date| format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]))
@@ -503,8 +574,42 @@ fn stop_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Read through a complete line, but retain at most `limit` bytes. An
+/// unterminated diagnostic must not cause read_until() to allocate gigabytes
+/// before the subprocess deadline/cancellation is checked.
+///
+/// Delimiters are still consumed after truncation, preserving the following
+/// yt-dlp progress and ERROR lines. This only discards text that exceeded the
+/// existing stdout cap or stderr diagnostic tail budget.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    line.clear();
+    if limit == 0 {
+        return reader.skip_until(b'\n');
+    }
+    // read_until and skip_until use the standard library's optimized newline
+    // search. Limit the first read so it cannot grow an unbounded Vec, then
+    // consume any overflow without allocating it.
+    let prefix_bytes = io::Read::take(&mut *reader, limit as u64).read_until(b'\n', line)?;
+    if prefix_bytes == 0 || line.last() == Some(&b'\n') {
+        return Ok(prefix_bytes);
+    }
+    let overflow_bytes = reader.skip_until(b'\n')?;
+    if overflow_bytes > 0 {
+        // Preserve a boundary even when the stored prefix was truncated.
+        // Without this, the next ERROR line can merge with the prior text.
+        if let Some(last) = line.last_mut() {
+            *last = b'\n';
+        }
+    }
+    Ok(prefix_bytes.saturating_add(overflow_bytes))
+}
+
 // Pipes are drained on dedicated reader threads so the child cannot block on
-// a full pipe. The output is capped; deadlines and cancellation kill the tree.
+// a full pipe. Individual lines and aggregate output are bounded.
 pub fn run_bounded(
     mut child: std::process::Child,
     deadline: Duration,
@@ -539,7 +644,7 @@ pub fn run_bounded(
         let mut output = String::new();
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::new();
-        while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
+        while read_bounded_line(&mut reader, &mut line, 12_000_000).unwrap_or(0) != 0 {
             if output.len() < 12_000_000 {
                 let text = String::from_utf8_lossy(&line);
                 if let Some((percent, detail)) = parse_percent(text.trim()) {
@@ -564,7 +669,7 @@ pub fn run_bounded(
         let mut result = Vec::new();
         let mut input = BufReader::new(stderr);
         let mut line = Vec::new();
-        while input.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
+        while read_bounded_line(&mut input, &mut line, 16_384).unwrap_or(0) != 0 {
             let text = String::from_utf8_lossy(&line);
             if let Some((percent, detail)) = parse_percent(text.trim()) {
                 if let Ok(callback) = stderr_progress.lock() {
@@ -601,7 +706,28 @@ pub fn run_bounded(
         }
         match child.try_wait() {
             Ok(Some(status)) => break (status.success(), String::new()),
-            Ok(None) => std::thread::sleep(Duration::from_millis(130)),
+            Ok(None) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    // A timed kernel wait wakes immediately when yt-dlp exits.
+                    // The 20 ms bound keeps cancellation and deadlines responsive
+                    // without waking the CPU continuously during long downloads.
+                    let waited = unsafe {
+                        windows_sys::Win32::System::Threading::WaitForSingleObject(
+                            child.as_raw_handle(),
+                            20,
+                        )
+                    };
+                    if waited == windows_sys::Win32::Foundation::WAIT_FAILED {
+                        let error = std::io::Error::last_os_error();
+                        stop_process_tree(&mut child);
+                        break (false, format!("Unable to wait for yt-dlp: {error}"));
+                    }
+                }
+                #[cfg(not(windows))]
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Err(e) => {
                 stop_process_tree(&mut child);
                 break (false, e.to_string());
@@ -679,6 +805,258 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "offline channel metadata CPU benchmark, no yt-dlp or network"]
+    fn benchmark_channel_metadata_parsing_realistic_sizes() {
+        for count in [10usize, 100, 200, 1000] {
+            let mut entries = Vec::with_capacity(count);
+            for i in 0..count {
+                entries.push(serde_json::json!({
+                    "id": format!("{i:011}"),
+                    "title": format!("Episode {i} - a useful title for a realistic creator upload"),
+                    "duration": 3872,
+                    "upload_date": "20261025",
+                    "url": format!("https://www.youtube.com/watch?v={i:011}"),
+                    "webpage_url": format!("https://www.youtube.com/watch?v={i:011}"),
+                    "thumbnails": [
+                        {"url":"https://i.ytimg.com/vi/example/hqdefault.jpg", "width": 480, "height": 360},
+                        {"url":"https://i.ytimg.com/vi/example/mqdefault.jpg", "width": 320, "height": 180},
+                        {"url":"https://i.ytimg.com/vi/example/sddefault.jpg", "width": 640, "height": 480}
+                    ],
+                    "tags": ["tutorial", "content", "2026", "video"],
+                    "channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+                    "channel_follower_count": 345000,
+                    "extra": {"format_id": "some", "duration_string": "64:32", "formats": ["mp4","webm"]}
+                }));
+            }
+            let json = serde_json::to_string(
+                &serde_json::json!({"channel": "Example channel", "entries": entries}),
+            )
+            .unwrap();
+            let iterations = if count >= 1000 { 50 } else { 150 };
+            let mut elapsed = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let (_, videos) = parse_channel_page_json(&json, true).unwrap();
+                assert_eq!(videos.len(), count.min(200));
+                elapsed.push(started.elapsed().as_micros());
+            }
+            elapsed.sort_unstable();
+            println!(
+                "metadata entries={count} json_kib={} iterations={iterations}: p50={}us p95={}us",
+                json.len() / 1024,
+                elapsed[iterations / 2],
+                elapsed[iterations * 95 / 100]
+            );
+        }
+    }
+
+    #[test]
+    fn long_unterminated_lines_are_bounded_and_following_progress_is_preserved() {
+        let mut stream = vec![b'x'; 20_000_000];
+        stream.extend_from_slice(b"\n__YCD_PROGRESS__87%|3MiB/s|00:01\nERROR: LAST_DIAGNOSTIC\n");
+        let mut reader = BufReader::new(stream.as_slice());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16_384).unwrap(),
+            20_000_001
+        );
+        assert_eq!(line.len(), 16_384);
+        assert!(line.capacity() <= 16_384);
+        assert_eq!(line.last(), Some(&b'\n'));
+        let next_size = read_bounded_line(&mut reader, &mut line, 16_384).unwrap();
+        assert!(next_size > 0);
+        assert_eq!(
+            parse_percent(String::from_utf8_lossy(&line).trim())
+                .unwrap()
+                .0,
+            87
+        );
+        assert!(read_bounded_line(&mut reader, &mut line, 16_384).unwrap() > 0);
+        assert_eq!(
+            String::from_utf8_lossy(&line).trim(),
+            "ERROR: LAST_DIAGNOSTIC"
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16_384).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_reader_preserves_crlf_exact_limit_and_unterminated_eof() {
+        let input = b"ERROR: first\r\n__YCD_PROGRESS__42%|3MiB/s|00:01\r\nERROR: last";
+        let mut reader = BufReader::with_capacity(3, &input[..]);
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16_384).unwrap(),
+            14
+        );
+        assert_eq!(&line, b"ERROR: first\r\n");
+        assert!(read_bounded_line(&mut reader, &mut line, 16_384).unwrap() > 0);
+        assert_eq!(
+            parse_percent(String::from_utf8_lossy(&line).trim())
+                .unwrap()
+                .0,
+            42
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16_384).unwrap(),
+            11
+        );
+        assert_eq!(&line, b"ERROR: last");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 16_384).unwrap(),
+            0
+        );
+
+        let bytes = b"1234567\nNEXT\r\n";
+        let mut exact_reader = BufReader::new(&bytes[..]);
+        assert_eq!(
+            read_bounded_line(&mut exact_reader, &mut line, 8).unwrap(),
+            8
+        );
+        assert_eq!(&line, b"1234567\n");
+        assert_eq!(
+            read_bounded_line(&mut exact_reader, &mut line, 8).unwrap(),
+            6
+        );
+        assert_eq!(&line, b"NEXT\r\n");
+
+        let mut overflow_crlf = BufReader::new(&b"xxxxxxxxxxxxxxxx\r\nERROR: preserved\r\n"[..]);
+        assert_eq!(
+            read_bounded_line(&mut overflow_crlf, &mut line, 8).unwrap(),
+            18
+        );
+        assert_eq!(line.len(), 8);
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(
+            read_bounded_line(&mut overflow_crlf, &mut line, 32).unwrap(),
+            18
+        );
+        assert_eq!(&line, b"ERROR: preserved\r\n");
+    }
+
+    #[test]
+    #[ignore = "offline bounded-line parser benchmark, 10-1000 progress events and long lines"]
+    fn benchmark_bounded_line_transport() {
+        for lines in [10usize, 100, 1000, 10000] {
+            let input = b"__YCD_PROGRESS__42.0%|3MiB/s|00:01\n".repeat(lines);
+            let old_started = Instant::now();
+            let mut old = BufReader::new(input.as_slice());
+            let mut line = Vec::new();
+            let mut count = 0;
+            while old.read_until(b'\n', &mut line).unwrap() > 0 {
+                count += 1;
+                line.clear();
+            }
+            let old_time = old_started.elapsed();
+            assert_eq!(count, lines);
+            let new_started = Instant::now();
+            let mut new = BufReader::new(input.as_slice());
+            let mut bounded = Vec::new();
+            let mut count = 0;
+            while read_bounded_line(&mut new, &mut bounded, 16_384).unwrap() > 0 {
+                count += 1;
+            }
+            let new_time = new_started.elapsed();
+            assert_eq!(count, lines);
+            println!(
+                "Progress lines={lines}: read_until={old_time:?} bounded={new_time:?} ratio={:.2}x",
+                old_time.as_secs_f64() / new_time.as_secs_f64()
+            );
+        }
+        let line_bytes = 20_000_000;
+        let bytes = vec![b'x'; line_bytes];
+        let old_started = Instant::now();
+        let mut old = BufReader::new(bytes.as_slice());
+        let mut old_line = Vec::new();
+        assert_eq!(old.read_until(b'\n', &mut old_line).unwrap(), line_bytes);
+        let old_time = old_started.elapsed();
+        let new_started = Instant::now();
+        let mut new = BufReader::new(bytes.as_slice());
+        let mut new_line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut new, &mut new_line, 16_384).unwrap(),
+            line_bytes
+        );
+        let new_time = new_started.elapsed();
+        println!(
+            "20 MB unterminated stderr: read_until={old_time:?} allocated={} bytes; bounded={new_time:?} allocated={} bytes",
+            old_line.capacity(),
+            new_line.capacity()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "offline 1- and 3-process yt-dlp progress transport proxy; no media/network"]
+    fn benchmark_mock_parallel_progress_transport() {
+        use std::sync::atomic::AtomicUsize;
+        for (parallel, events) in [(1usize, 100usize), (3, 100), (3, 1000)] {
+            let started = Instant::now();
+            let mut handles = Vec::new();
+            for _ in 0..parallel {
+                handles.push(std::thread::spawn(move || {
+                    let script = format!(
+                        "for($i=0;$i -lt {events};$i++){{[Console]::Error.WriteLine('__YCD_PROGRESS__42%|3MiB/s|00:01')}};[Console]::Out.WriteLine('MOCK_OK')"
+                    );
+                    let child = Command::new("powershell.exe")
+                        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let count = Arc::new(AtomicUsize::new(0));
+                    let received = Arc::clone(&count);
+                    let result = run_bounded(child, Duration::from_secs(15), None, move |_, _| {
+                        received.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .unwrap();
+                    assert!(result.1.contains("MOCK_OK"));
+                    assert_eq!(count.load(Ordering::Relaxed), events);
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            println!(
+                "Mock yt-dlp transport parallel={parallel} events/child={events}: elapsed={:?} total_events={}",
+                started.elapsed(),
+                parallel * events
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "manual, offline subprocess latency measurement"]
+    fn bench_short_lived_mock_process() {
+        let samples = 24;
+        let mut elapsed = Vec::new();
+        for _ in 0..samples {
+            let child = Command::new("cmd.exe")
+                .args(["/C", "echo MOCK_METADATA_OK"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            let output = run_bounded(child, Duration::from_secs(5), None, |_, _| {}).unwrap();
+            assert!(output.1.contains("MOCK_METADATA_OK"));
+            elapsed.push(start.elapsed().as_micros());
+        }
+        elapsed.sort_unstable();
+        println!(
+            "mock process (n={}): min={}us median={}us p90={}us max={}us",
+            samples,
+            elapsed[0],
+            elapsed[samples / 2],
+            elapsed[samples * 9 / 10],
+            elapsed[samples - 1]
+        );
+    }
+
+    #[test]
     fn accepts_only_real_channel_addresses() {
         assert_eq!(
             channel_url("@ExampleCreator").unwrap(),
@@ -718,6 +1096,31 @@ mod tests {
                 .len(),
             0
         );
+        for input in [
+            r#"{"channel":"Missing"}"#,
+            r#"{"channel":"Null","entries":null}"#,
+        ] {
+            assert_eq!(
+                parse_channel_page_json(input, true).unwrap_err(),
+                "yt-dlp did not return a channel video list."
+            );
+        }
+    }
+
+    #[test]
+    fn parser_skips_non_object_entries_without_discarding_valid_metadata() {
+        let source = r#"{"channel":null,"title":"Fallback title","entries":[null,false,17,2.5,"bad",[],{},
+        {"id":"abcdefghijk","title":23,"duration":"bad","upload_date":false,"unused":{"large":["nested","discarded"]}},
+        {"id":"pqrstuvwxyz","title":"Preserved","duration":60,"upload_date":"20261029","unused":{"metadata":[1,2,3]}},
+        {"id":"abcdefghijk","title":"Duplicate"}]}"#;
+        let (name, videos) = parse_channel_page_json(source, false).unwrap();
+        assert_eq!(name, "Fallback title");
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].title, "Untitled video");
+        assert_eq!(videos[0].duration, "Duration unknown");
+        assert_eq!(videos[1].title, "Preserved");
+        assert_eq!(videos[1].duration, "1:00");
+        assert_eq!(videos[1].uploaded, "2026-10-29");
     }
 
     #[test]
@@ -936,6 +1339,28 @@ mod tests {
         let began = Instant::now();
         let cancel = Arc::new(AtomicBool::new(true));
         let result = run_bounded(child, Duration::from_secs(8), Some(cancel), |_, _| {});
+        assert_eq!(result.unwrap_err(), "Download cancelled.");
+        assert!(began.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_cancellation_after_launch_interrupts_wait() {
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(70));
+            signal.store(true, Ordering::Relaxed);
+        });
+        let began = Instant::now();
+        let result = run_bounded(child, Duration::from_secs(8), Some(cancel), |_, _| {});
+        setter.join().unwrap();
         assert_eq!(result.unwrap_err(), "Download cancelled.");
         assert!(began.elapsed() < Duration::from_secs(4));
     }
