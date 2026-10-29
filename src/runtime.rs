@@ -503,9 +503,16 @@ mod tests {
         let payload = make_payload(&sample_files());
         let directory = ensure_runtime_at(&payload, &root, "ab12cd34").unwrap();
         let tool = directory.join(REQUIRED_TOOLS[0]);
+        let original_modified = fs::metadata(&tool).unwrap().modified().unwrap();
         let mut bytes = fs::read(&tool).unwrap();
         bytes[0] ^= 1;
         fs::write(&tool, &bytes).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
 
         let error = ensure_runtime_at(&payload, &root, "ab12cd34").unwrap_err();
         assert!(error.contains("SHA-256 check"), "unexpected error: {error}");
