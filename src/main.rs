@@ -3,6 +3,7 @@
 mod engine;
 mod progress;
 mod recommendations;
+mod runtime;
 #[cfg(windows)]
 mod single_instance;
 mod store;
@@ -1155,6 +1156,10 @@ fn show_queue_error(ui: &MainWindow, text: impl Into<String>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--verify-embedded-runtime") {
+        runtime::verify_embedded_runtime().map_err(std::io::Error::other)?;
+        return Ok(());
+    }
     #[cfg(windows)]
     let _instance = if std::env::var("YTD_UI_SMOKE_PREVIEW").as_deref() == Ok("1") {
         // Synthetic screenshot sessions use a separate app-data directory and
@@ -1164,6 +1169,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(single_instance::InstanceGuard::acquire()?)
     };
     let ui = MainWindow::new()?;
+    // Provision and verify the embedded tools on first launch, while leaving
+    // the established session/history location completely unchanged.
+    let runtime_error = runtime::embedded_runtime_dir().err();
     let (loaded_state, restore_notice) = restore_state();
     let folder = loaded_state.folder.clone();
     ui.set_channel_url(loaded_state.channel_url.clone().into());
@@ -1280,6 +1288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(notice) = restore_notice {
         show_error(&ui, notice);
+    }
+    if let Some(error) = runtime_error {
+        ui.set_status_text(format!("Bundled tools could not be prepared: {error}").into());
     }
 
     ui.on_add_recommended_channel({

@@ -391,6 +391,13 @@ pub fn parse_percent(line: &str) -> Option<(i32, String)> {
 }
 
 pub fn find_dependency(file: &str) -> Result<PathBuf, String> {
+    // A standalone executable must always use the tools embedded in that exact
+    // build. Do not silently substitute a stale sibling executable or PATH copy.
+    if crate::runtime::has_embedded_payload() {
+        let directory = crate::runtime::embedded_runtime_dir()?
+            .ok_or_else(|| "The embedded runtime is unavailable.".to_string())?;
+        return crate::runtime::resolve_embedded_dependency(&directory, file);
+    }
     let here = std::env::current_exe()
         .map_err(|_| "Cannot locate the application executable.".to_string())?;
     let parent = here
