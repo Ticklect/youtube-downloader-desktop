@@ -1,7 +1,11 @@
 use crate::engine::{channel_url, validate_id, Mode, Video, MAX_CHANNEL_VIDEOS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::{fs, io};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -10,6 +14,10 @@ pub const MAX_CHANNEL_HISTORY: usize = 64;
 pub const MAX_SAVED_CHANNELS: usize = 16;
 // Accommodate a saved 1,000-video library plus bounded queue/history entries.
 const MAX_FILE_BYTES: u64 = 8_000_000;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Only the final rename needs a lock. Encode and write temporary files in
+// parallel; do not publish a snapshot if a later save request has committed.
+static PUBLISHED_SAVES: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedChannel {
@@ -58,9 +66,9 @@ pub struct SavedState {
     pub theme: String,
     pub channel_name: String,
     pub channel_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_channel_history")]
     pub channel_history: Vec<SavedChannelHistory>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_saved_channels")]
     pub saved_channels: Vec<SavedChannel>,
     pub folder: PathBuf,
     pub videos: Vec<SavedVideo>,
@@ -123,6 +131,22 @@ fn recover_saved_channels(value: Value) -> Vec<SavedChannel> {
         .filter(|entry| valid_channel(&entry.name, &entry.url) && seen.insert(entry.url.clone()))
         .take(MAX_SAVED_CHANNELS)
         .collect()
+}
+
+fn deserialize_channel_history<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SavedChannelHistory>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(recover_channel_history(Value::deserialize(deserializer)?))
+}
+
+fn deserialize_saved_channels<'de, D>(deserializer: D) -> Result<Vec<SavedChannel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(recover_saved_channels(Value::deserialize(deserializer)?))
 }
 
 impl SavedState {
@@ -192,28 +216,23 @@ pub fn load(path: &Path) -> Result<Option<SavedState>, String> {
     if metadata.len() > MAX_FILE_BYTES {
         return Err("Saved session is larger than permitted.".into());
     }
-    let contents =
-        fs::read(path).map_err(|error| format!("Unable to read saved session: {error}"))?;
+    // The file can grow or change after metadata(): cap the actual bytes read.
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)
+        .map_err(|error| format!("Unable to read saved session: {error}"))?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| format!("Unable to read saved session: {error}"))?;
     if contents.len() as u64 > MAX_FILE_BYTES {
         return Err("Saved session is larger than permitted.".into());
     }
-    let mut document: Value = serde_json::from_slice(&contents)
-        .map_err(|_| "Saved session file has invalid JSON.".to_owned())?;
     // Optional channel suggestions must never make an otherwise healthy
     // download queue unrecoverable. A damaged entry is discarded locally;
     // the core videos, jobs and configuration retain their strict validation.
-    let (history, saved_channels) = if let Some(fields) = document.as_object_mut() {
-        (
-            fields.remove("channel_history").unwrap_or(Value::Null),
-            fields.remove("saved_channels").unwrap_or(Value::Null),
-        )
-    } else {
-        (Value::Null, Value::Null)
-    };
-    let mut state: SavedState = serde_json::from_value(document)
+    // Deserialize the main state in one pass to avoid copying every queue entry
+    // into an intermediate JSON Value first.
+    let mut state: SavedState = serde_json::from_slice(&contents)
         .map_err(|_| "Saved session file has invalid JSON.".to_owned())?;
-    state.channel_history = recover_channel_history(history);
-    state.saved_channels = recover_saved_channels(saved_channels);
     state.validate()?;
     for job in &mut state.jobs {
         if job.state == SavedJobStatus::Active {
@@ -225,6 +244,18 @@ pub fn load(path: &Path) -> Result<Option<SavedState>, String> {
 }
 
 pub fn save(path: &Path, snapshot: &SavedState) -> Result<(), String> {
+    save_with_hook(path, snapshot, || {})
+}
+
+// The hook provides a deterministic pause after ticket allocation in tests.
+// Normal callers pass an empty closure, which optimizes away.
+fn save_with_hook(
+    path: &Path,
+    snapshot: &SavedState,
+    after_ticket: impl FnOnce(),
+) -> Result<(), String> {
+    let ticket = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    after_ticket();
     snapshot.validate()?;
     let content = serde_json::to_vec(snapshot).map_err(|_| "Unable to encode saved session.")?;
     if content.len() as u64 > MAX_FILE_BYTES {
@@ -237,13 +268,51 @@ pub fn save(path: &Path, snapshot: &SavedState) -> Result<(), String> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("Invalid session filename.")?;
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    fs::write(&temp, content).map_err(|error| format!("Unable to write session: {error}"))?;
-    if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("Unable to atomically save session: {error}"));
+    // Concurrent saves in the same process must not truncate or rename each
+    // other's temporary file. create_new also avoids stale PID file collisions.
+    for attempt in 0..16 {
+        let sequence = if attempt == 0 {
+            ticket
+        } else {
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        };
+        let temp = parent.join(format!(
+            ".{file_name}.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Unable to write session: {error}")),
+        };
+        let written = file.write_all(&content);
+        drop(file);
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Unable to write session: {error}"));
+        }
+        let committed = PUBLISHED_SAVES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut committed = committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if committed.get(path).is_some_and(|last| *last > ticket) {
+            drop(committed);
+            let _ = fs::remove_file(&temp);
+            return Ok(());
+        }
+        if let Err(error) = fs::rename(&temp, path) {
+            drop(committed);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("Unable to atomically save session: {error}"));
+        }
+        committed.insert(path.to_path_buf(), ticket);
+        return Ok(());
     }
-    Ok(())
+    Err("Unable to allocate a unique session temporary file.".into())
 }
 
 #[cfg(test)]
@@ -474,5 +543,204 @@ mod tests {
         );
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_saves_keep_a_complete_session() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ycd-concurrent-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("session.json");
+        let mut snapshot = sample();
+        snapshot.jobs = vec![snapshot.jobs[0].clone(); MAX_JOBS];
+        let snapshot = Arc::new(snapshot);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|writer| {
+                let snapshot = Arc::clone(&snapshot);
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut snapshot = (*snapshot).clone();
+                    snapshot.channel_name = format!("Writer {writer}");
+                    barrier.wait();
+                    for _ in 0..12 {
+                        save(&path, &snapshot).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let restored = load(&path).unwrap().unwrap();
+        assert!(restored.channel_name.starts_with("Writer "));
+        assert_eq!(restored.jobs.len(), MAX_JOBS);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn thousand_job_queue_roundtrips_repeatedly() {
+        let dir = std::env::temp_dir().join(format!(
+            "ycd-queue-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("session.json");
+        let mut snapshot = sample();
+        snapshot.jobs = vec![snapshot.jobs[0].clone(); MAX_JOBS];
+        let started = std::time::Instant::now();
+        for _ in 0..24 {
+            save(&path, &snapshot).unwrap();
+            let restored = load(&path).unwrap().unwrap();
+            assert_eq!(restored.jobs.len(), MAX_JOBS);
+        }
+        eprintln!(
+            "queue-save-load: 24 iterations for {MAX_JOBS} jobs, elapsed={:?}",
+            started.elapsed()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn earlier_large_save_cannot_overwrite_later_small_save() {
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ycd-save-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("session.json");
+        let mut older = sample();
+        older.channel_name = "Older".into();
+        older.jobs = vec![older.jobs[0].clone(); MAX_JOBS];
+        older.jobs[0].video.title = "long title ".repeat(90);
+        for job in &mut older.jobs {
+            job.video.title = "long title ".repeat(90);
+        }
+        older.videos = vec![older.videos[0].clone(); MAX_CHANNEL_VIDEOS];
+        for video in &mut older.videos {
+            video.video.title = "long title ".repeat(90);
+        }
+        let mut newer = sample();
+        newer.channel_name = "Newer".into();
+
+        for _ in 0..8 {
+            let path_for_writer = path.clone();
+            let older_for_writer = older.clone();
+            let (sent, received) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                save_with_hook(&path_for_writer, &older_for_writer, || {
+                    sent.send(()).unwrap();
+                    // Force a newer request to commit before this older one
+                    // reaches its final rename.
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                })
+                .unwrap();
+            });
+            received.recv().unwrap();
+            save(&path, &newer).unwrap();
+            writer.join().unwrap();
+            assert_eq!(load(&path).unwrap().unwrap().channel_name, "Newer");
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn resume_only_requeues_active_jobs() {
+        let dir = std::env::temp_dir().join(format!(
+            "ycd-resume-states-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("session.json");
+        let mut snapshot = sample();
+        snapshot.jobs = [
+            SavedJobStatus::Active,
+            SavedJobStatus::Queued,
+            SavedJobStatus::Completed,
+            SavedJobStatus::Failed,
+            SavedJobStatus::Cancelled,
+        ]
+        .into_iter()
+        .map(|state| SavedJob {
+            state,
+            ..snapshot.jobs[0].clone()
+        })
+        .collect();
+        save(&path, &snapshot).unwrap();
+        let restored = load(&path).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .jobs
+                .iter()
+                .map(|job| job.state)
+                .collect::<Vec<_>>(),
+            vec![
+                SavedJobStatus::Queued,
+                SavedJobStatus::Queued,
+                SavedJobStatus::Completed,
+                SavedJobStatus::Failed,
+                SavedJobStatus::Cancelled,
+            ]
+        );
+        assert!(restored.jobs[0].detail.contains("Resuming"));
+        assert_eq!(restored.jobs[4].detail, snapshot.jobs[4].detail);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_replacement_preserves_previous_session() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ycd-blocked-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("session.json");
+        let original = sample();
+        save(&path, &original).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001) // FILE_SHARE_READ; deny delete sharing.
+            .open(&path)
+            .unwrap();
+        let mut replacement = original.clone();
+        replacement.channel_name = "Replacement".into();
+        assert!(save(&path, &replacement).is_err());
+        drop(reader);
+        assert_eq!(
+            load(&path).unwrap().unwrap().channel_name,
+            original.channel_name
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

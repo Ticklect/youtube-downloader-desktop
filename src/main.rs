@@ -1,15 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod progress;
 mod recommendations;
 #[cfg(windows)]
 mod single_instance;
 mod store;
 mod thumbnails;
+#[cfg(test)]
+mod ui_event_benchmark;
 
 use engine::{Mode, Video};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -54,6 +57,44 @@ fn is_pending_duplicate(
         && matches!(job.status, JobState::Queued | JobState::Active)
 }
 
+fn unqueued_videos(
+    jobs: &[Job],
+    selected: Vec<Video>,
+    mode: Mode,
+    quality: &str,
+    folder: &PathBuf,
+) -> Vec<Video> {
+    // For a handful of selected videos the allocation/hash setup would cost
+    // more than a short linear scan. Keep the fast path for small queues.
+    if jobs.len().saturating_mul(selected.len()) <= 25_000 {
+        return selected
+            .into_iter()
+            .filter(|video| {
+                !jobs
+                    .iter()
+                    .any(|job| is_pending_duplicate(job, video, mode, quality, folder))
+            })
+            .collect();
+    }
+    // Only in-flight jobs with the same destination/format can be duplicates.
+    // Index them once: selecting 1,000 videos beside 1,000 history entries
+    // previously performed up to a million linear comparisons on the UI thread.
+    let pending_ids: std::collections::HashSet<&str> = jobs
+        .iter()
+        .filter(|job| {
+            job.mode == mode
+                && job.quality == quality
+                && job.folder == *folder
+                && matches!(job.status, JobState::Queued | JobState::Active)
+        })
+        .map(|job| job.video.id.as_str())
+        .collect();
+    selected
+        .into_iter()
+        .filter(|video| !pending_ids.contains(video.id.as_str()))
+        .collect()
+}
+
 fn begin_channel_request(generation: &AtomicU64) -> u64 {
     generation.fetch_add(1, Ordering::SeqCst) + 1
 }
@@ -92,27 +133,42 @@ impl State {
             jobs: self
                 .jobs
                 .iter()
-                .map(|job| store::SavedJob {
-                    video: job.video.clone(),
-                    mode: job.mode,
-                    quality: job.quality.clone(),
-                    folder: job.folder.clone(),
-                    state: match job.status {
-                        JobState::Queued => store::SavedJobStatus::Queued,
-                        JobState::Active => store::SavedJobStatus::Active,
-                        JobState::Completed => store::SavedJobStatus::Completed,
-                        JobState::Failed => store::SavedJobStatus::Failed,
-                        JobState::Cancelled => store::SavedJobStatus::Cancelled,
-                    },
-                    detail: job.detail.chars().take(300).collect(),
+                .map(|job| {
+                    // The worker remains Active until yt-dlp actually stops,
+                    // but a requested cancellation must survive an app exit.
+                    // Otherwise load() resumes it as a queued download.
+                    let cancelling =
+                        job.status == JobState::Active && job.cancel.load(Ordering::Relaxed);
+                    store::SavedJob {
+                        video: job.video.clone(),
+                        mode: job.mode,
+                        quality: job.quality.clone(),
+                        folder: job.folder.clone(),
+                        state: match job.status {
+                            JobState::Queued => store::SavedJobStatus::Queued,
+                            JobState::Active if cancelling => store::SavedJobStatus::Cancelled,
+                            JobState::Active => store::SavedJobStatus::Active,
+                            JobState::Completed => store::SavedJobStatus::Completed,
+                            JobState::Failed => store::SavedJobStatus::Failed,
+                            JobState::Cancelled => store::SavedJobStatus::Cancelled,
+                        },
+                        detail: if cancelling {
+                            "Cancelled by user.".to_owned()
+                        } else {
+                            job.detail.chars().take(300).collect()
+                        },
+                    }
                 })
                 .collect(),
         }
     }
 
+    fn persist_checked(&self) -> Result<(), String> {
+        store::save(&store::session_path(), &self.snapshot())
+    }
+
     fn persist(&self) {
-        let snapshot = self.snapshot();
-        if let Err(error) = store::save(&store::session_path(), &snapshot) {
+        if let Err(error) = self.persist_checked() {
             eprintln!("Unable to persist queue: {error}");
         }
     }
@@ -238,13 +294,32 @@ fn reconcile_videos(
     incoming: Vec<Video>,
     same_channel: bool,
 ) -> Vec<(Video, bool)> {
+    if !same_channel {
+        return incoming.into_iter().map(|video| (video, false)).collect();
+    }
+    // The first 200 refreshed videos may need to preserve selections from a
+    // 1,000-video saved library. Avoid rescanning the library for every ID.
+    // Keep the linear path for tiny lists where building a set costs more.
+    if previous.len().saturating_mul(incoming.len()) > 2_000 {
+        let selected_ids: std::collections::HashSet<&str> = previous
+            .iter()
+            .filter(|(_, selected)| *selected)
+            .map(|(video, _)| video.id.as_str())
+            .collect();
+        return incoming
+            .into_iter()
+            .map(|video| {
+                let retained = selected_ids.contains(video.id.as_str());
+                (video, retained)
+            })
+            .collect();
+    }
     incoming
         .into_iter()
         .map(|video| {
-            let retained = same_channel
-                && previous
-                    .iter()
-                    .any(|(old, selected)| old.id == video.id && *selected);
+            let retained = previous
+                .iter()
+                .any(|(old, selected)| old.id == video.id && *selected);
             (video, retained)
         })
         .collect()
@@ -354,8 +429,51 @@ fn publish_video_selection_counts(ui: &MainWindow, state: &State) {
 }
 
 fn publish_videos(ui: &MainWindow, state: &State) {
+    publish_filtered_videos(ui, state);
+    publish_selected_videos(ui, state);
+}
+
+fn existing_video_thumbnails(
+    model: &ModelRc<VideoRow>,
+) -> std::collections::HashMap<String, slint::Image> {
+    (0..model.row_count())
+        .filter_map(|index| model.row_data(index))
+        .map(|row| (row.id.to_string(), row.thumbnail))
+        .collect()
+}
+
+fn thumbnail_for_video(
+    id: &str,
+    previous: &std::collections::HashMap<String, slint::Image>,
+) -> slint::Image {
+    previous.get(id).cloned().unwrap_or_else(|| {
+        thumbnails::cached(id)
+            .and_then(|path| slint::Image::load_from_path(&path).ok())
+            .unwrap_or_default()
+    })
+}
+
+fn video_row_unchanged(existing: &VideoRow, refreshed: &VideoRow) -> bool {
+    existing.id == refreshed.id
+        && existing.title == refreshed.title
+        && existing.title_long == refreshed.title_long
+        && existing.detail == refreshed.detail
+        && existing.secondary == refreshed.secondary
+        && existing.selected == refreshed.selected
+    // The thumbnail comes from the existing row or the background changed-ID
+    // callback. Re-publishing identical metadata must not discard an image
+    // or notify the repeater about a redundant row mutation.
+}
+
+fn publish_filtered_videos(ui: &MainWindow, state: &State) {
     publish_video_selection_counts(ui, state);
     let filter = ui.get_video_search().to_string().trim().to_lowercase();
+    // Slint has a small decoded-image cache. Reopening the same image paths on
+    // every keystroke is unnecessary when the image already lives in a row.
+    // The asynchronous fetch callback updates these live rows when new IDs
+    // become available; images for newly revealed rows load from disk once.
+    let previous = ui.get_videos();
+    let previous_images = existing_video_thumbnails(&previous);
     let visible_rows = state
         .videos
         .iter()
@@ -371,16 +489,13 @@ fn publish_videos(ui: &MainWindow, state: &State) {
                 format!("Published {}", video.uploaded)
             }
             .into(),
-            thumbnail: thumbnails::cached(&video.id)
-                .and_then(|path| slint::Image::load_from_path(&path).ok())
-                .unwrap_or_default(),
+            thumbnail: thumbnail_for_video(&video.id, &previous_images),
             selected: *selected,
         })
         .collect::<Vec<_>>();
     // Preserve the live Slint repeater and focused row during selection
     // changes. Replacing the entire model on each toggle dropped keyboard
     // focus, so Space could not toggle the same video twice in succession.
-    let previous = ui.get_videos();
     let previous_len = previous.row_count();
     let prefix_identity = previous_len > 0
         && previous_len <= visible_rows.len()
@@ -395,7 +510,12 @@ fn publish_videos(ui: &MainWindow, state: &State) {
             });
     if prefix_identity {
         for (index, row) in visible_rows.iter().take(previous_len).cloned().enumerate() {
-            previous.set_row_data(index, row);
+            if !previous
+                .row_data(index)
+                .is_some_and(|existing| video_row_unchanged(&existing, &row))
+            {
+                previous.set_row_data(index, row);
+            }
         }
         for row in visible_rows.into_iter().skip(previous_len) {
             // The view is a VecModel. Appending rows retains the scroll offset,
@@ -407,12 +527,13 @@ fn publish_videos(ui: &MainWindow, state: &State) {
     } else {
         ui.set_videos(ModelRc::from(Rc::new(VecModel::from(visible_rows))));
     }
-    publish_selected_videos(ui, state);
 }
 
 fn publish_selected_videos(ui: &MainWindow, state: &State) {
     // The review screen must show the complete selection, even when Library
     // search filters the visible list. Otherwise saved selections look lost.
+    let mut previous_images = existing_video_thumbnails(&ui.get_selected_videos());
+    previous_images.extend(existing_video_thumbnails(&ui.get_videos()));
     ui.set_selected_videos(ModelRc::from(Rc::new(VecModel::from(
         state
             .videos
@@ -429,9 +550,7 @@ fn publish_selected_videos(ui: &MainWindow, state: &State) {
                     format!("Published {}", video.uploaded)
                 }
                 .into(),
-                thumbnail: thumbnails::cached(&video.id)
-                    .and_then(|path| slint::Image::load_from_path(&path).ok())
-                    .unwrap_or_default(),
+                thumbnail: thumbnail_for_video(&video.id, &previous_images),
                 selected: *selected,
             })
             .collect::<Vec<_>>(),
@@ -475,21 +594,95 @@ fn update_thumbnails(ui: &MainWindow, state: &Arc<Mutex<State>>) {
             .map(|(v, _)| v.clone())
             .collect::<Vec<_>>()
     };
-    update_page_thumbnails(ui, state, videos);
+    update_page_thumbnails(ui, videos);
 }
 
-fn update_page_thumbnails(ui: &MainWindow, state: &Arc<Mutex<State>>, videos: Vec<Video>) {
+/// A batch of fetched thumbnails changes only the corresponding image cells.
+/// Rebuilding every video row on each batch repeatedly decoded all cached
+/// images and recreated the selected-videos model, disturbing keyboard focus.
+fn apply_thumbnail_images(
+    models: &[ModelRc<VideoRow>; 2],
+    images: &std::collections::HashMap<String, slint::Image>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    for model in models {
+        for row_index in 0..model.row_count() {
+            let Some(mut row) = model.row_data(row_index) else {
+                continue;
+            };
+            if let Some(image) = images.get(row.id.as_str()) {
+                row.thumbnail = image.clone();
+                model.set_row_data(row_index, row);
+            }
+        }
+    }
+}
+
+fn refresh_video_thumbnails(ui: &MainWindow, changed_ids: Vec<String>) {
+    let images = changed_ids
+        .into_iter()
+        .filter_map(|id| {
+            let path = thumbnails::cached(&id)?;
+            let image = slint::Image::load_from_path(&path).ok()?;
+            Some((id, image))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let videos = ui.get_videos();
+    let selected = ui.get_selected_videos();
+    apply_thumbnail_images(&[videos, selected], &images);
+}
+
+fn update_page_thumbnails(ui: &MainWindow, videos: Vec<Video>) {
     let weak_ui = ui.as_weak();
-    let weak_state = Arc::downgrade(state);
-    thumbnails::update_in_background(videos, move || {
+    thumbnails::update_in_background(videos, move |changed_ids| {
         let ui = weak_ui.clone();
-        let state = weak_state.clone();
         let _ = slint::invoke_from_event_loop(move || {
-            if let (Some(ui), Some(state)) = (ui.upgrade(), state.upgrade()) {
-                publish_videos(&ui, &state.lock().unwrap());
+            if let Some(ui) = ui.upgrade() {
+                refresh_video_thumbnails(&ui, changed_ids);
             }
         });
     });
+}
+
+fn task_row_for_job(index: usize, job: &Job) -> TaskRow {
+    TaskRow {
+        job_index: index as i32,
+        title: job.video.title.clone().into(),
+        title_long: job.video.title.chars().count() > 40,
+        thumbnail: thumbnails::cached(&job.video.id)
+            .and_then(|path| slint::Image::load_from_path(&path).ok())
+            .unwrap_or_default(),
+        detail: format!("{}  ·  {}", job.detail, job.video.duration).into(),
+        metadata: format!(
+            "{}  ·  {}",
+            match job.mode {
+                Mode::Video => "Video",
+                Mode::Audio => "MP3",
+                Mode::Captions => "Captions",
+            },
+            if job.mode == Mode::Video {
+                if job.quality == "best" {
+                    "Best quality"
+                } else {
+                    &job.quality
+                }
+            } else {
+                "Original"
+            },
+        )
+        .into(),
+        progress: job.percent,
+        state: match job.status {
+            JobState::Queued => "Queued",
+            JobState::Active => "Downloading",
+            JobState::Completed => "Completed",
+            JobState::Failed => "Failed",
+            JobState::Cancelled => "Cancelled",
+        }
+        .into(),
+    }
 }
 
 fn publish_tasks(ui: &MainWindow, state: &State) {
@@ -506,44 +699,13 @@ fn publish_tasks(ui: &MainWindow, state: &State) {
                 "failed" => job.status == JobState::Failed,
                 _ => true,
             })
-            .map(|(index, job)| TaskRow {
-                job_index: index as i32,
-                title: job.video.title.clone().into(),
-                title_long: job.video.title.chars().count() > 40,
-                thumbnail: thumbnails::cached(&job.video.id)
-                    .and_then(|path| slint::Image::load_from_path(&path).ok())
-                    .unwrap_or_default(),
-                detail: format!("{}  ·  {}", job.detail, job.video.duration).into(),
-                metadata: format!(
-                    "{}  ·  {}",
-                    match job.mode {
-                        Mode::Video => "Video",
-                        Mode::Audio => "MP3",
-                        Mode::Captions => "Captions",
-                    },
-                    if job.mode == Mode::Video {
-                        if job.quality == "best" {
-                            "Best quality"
-                        } else {
-                            &job.quality
-                        }
-                    } else {
-                        "Original"
-                    },
-                )
-                .into(),
-                progress: job.percent,
-                state: match job.status {
-                    JobState::Queued => "Queued",
-                    JobState::Active => "Downloading",
-                    JobState::Completed => "Completed",
-                    JobState::Failed => "Failed",
-                    JobState::Cancelled => "Cancelled",
-                }
-                .into(),
-            })
+            .map(|(index, job)| task_row_for_job(index, job))
             .collect::<Vec<_>>(),
     ))));
+    publish_task_counters(ui, state);
+}
+
+fn publish_task_counters(ui: &MainWindow, state: &State) {
     let done = state
         .jobs
         .iter()
@@ -586,6 +748,161 @@ fn publish_tasks(ui: &MainWindow, state: &State) {
     );
 }
 
+/// Update the lifecycle of a stable job in the existing newest-first model.
+/// For filtered queues a status transition may add/remove a row, so callers
+/// must rebuild the filtered model instead.
+fn set_task_row_lifecycle(model: &ModelRc<TaskRow>, index: usize, job: &Job) -> bool {
+    let mut start = 0;
+    let mut end = model.row_count();
+    while start < end {
+        let middle = start + (end - start) / 2;
+        let Some(mut row) = model.row_data(middle) else {
+            return false;
+        };
+        match row.job_index.cmp(&(index as i32)) {
+            std::cmp::Ordering::Greater => start = middle + 1,
+            std::cmp::Ordering::Less => end = middle,
+            std::cmp::Ordering::Equal => {
+                row.progress = job.percent;
+                row.detail = format!("{}  ·  {}", job.detail, job.video.duration).into();
+                row.state = match job.status {
+                    JobState::Queued => "Queued",
+                    JobState::Active => "Downloading",
+                    JobState::Completed => "Completed",
+                    JobState::Failed => "Failed",
+                    JobState::Cancelled => "Cancelled",
+                }
+                .into();
+                model.set_row_data(middle, row);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Locate an existing row or its insertion point in the newest-first model.
+fn task_row_position(model: &ModelRc<TaskRow>, index: usize) -> Option<(usize, bool)> {
+    let mut start = 0;
+    let mut end = model.row_count();
+    while start < end {
+        let middle = start + (end - start) / 2;
+        let row = model.row_data(middle)?;
+        match row.job_index.cmp(&(index as i32)) {
+            std::cmp::Ordering::Greater => start = middle + 1,
+            std::cmp::Ordering::Less => end = middle,
+            std::cmp::Ordering::Equal => return Some((middle, true)),
+        }
+    }
+    Some((start, false))
+}
+
+fn task_status_matches_filter(filter: &str, status: JobState) -> bool {
+    match filter {
+        "active" => matches!(status, JobState::Active | JobState::Queued),
+        "completed" => status == JobState::Completed,
+        "failed" => status == JobState::Failed,
+        _ => true,
+    }
+}
+
+/// A completion changes at most one row's membership, and starting a queued
+/// replacement changes only its state. Preserve the filtered VecModel and all
+/// unaffected rows, falling back to a full rebuild on unexpected model state.
+fn update_task_membership(
+    model: &ModelRc<TaskRow>,
+    index: usize,
+    job: &Job,
+    was_visible: bool,
+    now_visible: bool,
+) -> bool {
+    let Some((position, exists)) = task_row_position(model, index) else {
+        return false;
+    };
+    if exists != was_visible {
+        return false;
+    }
+    match (exists, now_visible) {
+        (true, true) => set_task_row_lifecycle(model, index, job),
+        (true, false) => model.remove_row(position).is_ok(),
+        (false, true) => model
+            .insert_row(position, task_row_for_job(index, job))
+            .is_ok(),
+        (false, false) => true,
+    }
+}
+
+/// Keep queue rows stable on routine completed-job transitions. Once filters
+/// change membership, or a new job changes the queue length, rebuild once.
+fn publish_scheduled_changes(
+    ui: &MainWindow,
+    state: &State,
+    finished: usize,
+    newly_active: &[usize],
+) {
+    let tasks = ui.get_tasks();
+    let filter = ui.get_queue_filter();
+    if !matches!(filter.as_str(), "all" | "active" | "completed" | "failed")
+        || (filter.as_str() == "all" && tasks.row_count() != state.jobs.len())
+    {
+        publish_tasks(ui, state);
+        return;
+    }
+    let was_active_visible = task_status_matches_filter(&filter, JobState::Active);
+    let was_queued_visible = task_status_matches_filter(&filter, JobState::Queued);
+    if !update_task_membership(
+        &tasks,
+        finished,
+        &state.jobs[finished],
+        was_active_visible,
+        task_status_matches_filter(&filter, state.jobs[finished].status),
+    ) || newly_active.iter().any(|&index| {
+        !update_task_membership(
+            &tasks,
+            index,
+            &state.jobs[index],
+            was_queued_visible,
+            task_status_matches_filter(&filter, state.jobs[index].status),
+        )
+    }) {
+        publish_tasks(ui, state);
+        return;
+    }
+    publish_task_counters(ui, state);
+}
+
+/// Progress changes only one task. Queue rows are always newest-first (see
+/// publish_tasks), including after status filters. Binary search avoids
+/// cloning hundreds of Slint row values for each progress update while
+/// retaining the existing model, scroll position and accessibility focus.
+fn set_task_row_progress(
+    model: &ModelRc<TaskRow>,
+    job_index: usize,
+    percent: i32,
+    detail: &str,
+    duration: &str,
+) -> bool {
+    let mut start = 0;
+    let mut end = model.row_count();
+    while start < end {
+        let middle = start + (end - start) / 2;
+        let Some(mut row) = model.row_data(middle) else {
+            return false;
+        };
+        match row.job_index.cmp(&(job_index as i32)) {
+            std::cmp::Ordering::Greater => start = middle + 1,
+            std::cmp::Ordering::Less => end = middle,
+            std::cmp::Ordering::Equal => {
+                row.progress = percent;
+                row.detail = format!("{detail}  ·  {duration}").into();
+                model.set_row_data(middle, row);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn cancel_job(job: &mut Job) -> bool {
     match job.status {
         JobState::Queued => {
@@ -613,49 +930,123 @@ fn retry_job(job: &mut Job) -> bool {
     true
 }
 
+/// Do not discard download history in memory unless its removal was committed
+/// to the session file. Otherwise a denied write leaves the UI claiming the
+/// history was cleared while the next startup restores all of it.
+fn clear_finished_and_commit(state: &mut State, session: &Path) -> Result<usize, String> {
+    if state.active > 0 || state.jobs.iter().any(|job| job.status == JobState::Queued) {
+        return Err("Wait until the download queue is idle before clearing history.".into());
+    }
+    let mut snapshot = state.snapshot();
+    snapshot.jobs.retain(|job| {
+        matches!(
+            job.state,
+            store::SavedJobStatus::Queued | store::SavedJobStatus::Active
+        )
+    });
+    store::save(session, &snapshot)?;
+    let previous = state.jobs.len();
+    state
+        .jobs
+        .retain(|job| matches!(job.status, JobState::Queued | JobState::Active));
+    Ok(previous - state.jobs.len())
+}
+
 fn publish(ui: &MainWindow, state: &State) {
     publish_videos(ui, state);
     publish_tasks(ui, state);
 }
 
 fn schedule(ui: &MainWindow, state: &Arc<Mutex<State>>, yt_dlp: PathBuf, ffmpeg: PathBuf) {
+    schedule_after_completion(ui, state, yt_dlp, ffmpeg, None);
+}
+
+type ScheduledJob = (usize, Video, Mode, String, PathBuf, Arc<AtomicBool>);
+
+/// Reserve the next slots and durably record their Active states before any
+/// subprocess launches. A failed save must not launch downloads that a restart
+/// would not know about. Restore the in-memory reservations on failure.
+fn reserve_and_commit_jobs(
+    state: &mut State,
+    session: &Path,
+    max_parallel: usize,
+) -> Result<Vec<ScheduledJob>, String> {
+    let previous_active = state.active;
     let mut to_start = Vec::new();
-    {
-        let mut state = state.lock().unwrap();
-        for index in 0..state.jobs.len() {
-            if state.active >= engine::MAX_PARALLEL {
-                break;
-            }
-            if state.jobs[index].status != JobState::Queued {
-                continue;
-            }
-            state.jobs[index].status = JobState::Active;
-            state.jobs[index].detail = "Preparing download…".into();
-            state.active += 1;
-            let job = &state.jobs[index];
-            to_start.push((
-                index,
-                job.video.clone(),
-                job.mode,
-                job.quality.clone(),
-                job.folder.clone(),
-                job.cancel.clone(),
-            ));
+    let mut previous_details = Vec::new();
+    for index in 0..state.jobs.len() {
+        if state.active >= max_parallel {
+            break;
         }
+        if state.jobs[index].status != JobState::Queued {
+            continue;
+        }
+        previous_details.push((index, state.jobs[index].detail.clone()));
+        state.jobs[index].status = JobState::Active;
+        state.jobs[index].detail = "Preparing download…".into();
+        state.active += 1;
+        let job = &state.jobs[index];
+        to_start.push((
+            index,
+            job.video.clone(),
+            job.mode,
+            job.quality.clone(),
+            job.folder.clone(),
+            job.cancel.clone(),
+        ));
     }
-    {
-        let state = state.lock().unwrap();
-        state.persist();
-        publish_tasks(ui, &state);
+    if let Err(error) = store::save(session, &state.snapshot()) {
+        for (index, detail) in previous_details {
+            state.jobs[index].status = JobState::Queued;
+            state.jobs[index].detail = detail;
+        }
+        state.active = previous_active;
+        return Err(error);
     }
+    Ok(to_start)
+}
+
+fn schedule_after_completion(
+    ui: &MainWindow,
+    state: &Arc<Mutex<State>>,
+    yt_dlp: PathBuf,
+    ffmpeg: PathBuf,
+    finished_index: Option<usize>,
+) {
+    let to_start = {
+        let mut state = state.lock().unwrap();
+        match reserve_and_commit_jobs(&mut state, &store::session_path(), engine::MAX_PARALLEL) {
+            Ok(to_start) => {
+                if let Some(finished) = finished_index {
+                    let newly_active = to_start.iter().map(|item| item.0).collect::<Vec<_>>();
+                    publish_scheduled_changes(ui, &state, finished, &newly_active);
+                } else {
+                    publish_tasks(ui, &state);
+                }
+                to_start
+            }
+            Err(error) => {
+                publish_tasks(ui, &state);
+                show_queue_error(
+                    ui,
+                    format!(
+                        "Could not save download queue; no new downloads were started. {error}"
+                    ),
+                );
+                return;
+            }
+        }
+    };
     for (index, video, mode, quality, folder, cancel) in to_start {
         let weak = ui.as_weak();
         let state_for_progress = Arc::downgrade(state);
+        let progress_mailbox = Arc::new(progress::ProgressMailbox::default());
         let yt_dlp = yt_dlp.clone();
         let ffmpeg = ffmpeg.clone();
         std::thread::spawn(move || {
             let progress_ui = weak.clone();
             let progress_state = state_for_progress.clone();
+            let progress_mailbox_for_worker = progress_mailbox.clone();
             let result = engine::download_video(
                 engine::DownloadSpec {
                     executable: &yt_dlp,
@@ -667,19 +1058,39 @@ fn schedule(ui: &MainWindow, state: &Arc<Mutex<State>>, yt_dlp: PathBuf, ffmpeg:
                 },
                 cancel.clone(),
                 move |percent, detail| {
+                    if !progress_mailbox_for_worker.publish(percent, detail) {
+                        return;
+                    }
                     let weak = progress_ui.clone();
                     let state = progress_state.clone();
+                    let mailbox = progress_mailbox_for_worker.clone();
                     let _ = slint::invoke_from_event_loop(move || {
+                        let Some((percent, detail)) = mailbox.consume() else {
+                            return;
+                        };
                         if let (Some(ui), Some(state)) = (weak.upgrade(), state.upgrade()) {
                             let mut value = state.lock().unwrap();
                             if let Some(job) = value.jobs.get_mut(index) {
-                                if job.status != JobState::Active {
+                                if job.status != JobState::Active
+                                    || job.cancel.load(Ordering::Relaxed)
+                                {
                                     return;
                                 }
                                 job.percent = percent;
                                 job.detail = detail;
+                                // Queue filter can exclude this active job.
+                                // On visible rows, update only the changed
+                                // task; the counters and statuses are static.
+                                if matches!(ui.get_queue_filter().as_str(), "all" | "active") {
+                                    set_task_row_progress(
+                                        &ui.get_tasks(),
+                                        index,
+                                        job.percent,
+                                        &job.detail,
+                                        &job.video.duration,
+                                    );
+                                }
                             }
-                            publish_tasks(&ui, &value);
                         }
                     });
                 },
@@ -707,9 +1118,8 @@ fn schedule(ui: &MainWindow, state: &Arc<Mutex<State>>, yt_dlp: PathBuf, ffmpeg:
                         };
                     }
                     value.active = value.active.saturating_sub(1);
-                    value.persist();
                 }
-                schedule(&ui, &state, yt_dlp, ffmpeg);
+                schedule_after_completion(&ui, &state, yt_dlp, ffmpeg, Some(index));
             });
         });
     }
@@ -796,6 +1206,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    ui.on_minimize_window({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.window().set_minimized(true);
+            }
+        }
+    });
+    ui.on_close_window({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.hide();
+                let _ = slint::quit_event_loop();
+            }
+        }
+    });
     ui.on_toggle_maximize({
         let weak = ui.as_weak();
         move || {
@@ -1122,7 +1549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             if appended > 0 {
                                 publish_videos(&ui, &state.lock().unwrap());
-                                update_page_thumbnails(&ui, &state, incoming);
+                                update_page_thumbnails(&ui, incoming);
                             }
                             show_error(
                                 &ui,
@@ -1169,7 +1596,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
-                publish(&ui, &state.lock().unwrap());
+                // The review selection is unchanged by searching. Rebuilding
+                // that second list on every keystroke can decode hundreds
+                // more thumbnails and invalidate its accessibility model.
+                publish_filtered_videos(&ui, &state.lock().unwrap());
             }
         }
     });
@@ -1190,7 +1620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let search = ui.get_video_search().to_string();
             set_visible_selection(&mut state.lock().unwrap().videos, &search, true);
             state.lock().unwrap().persist();
-            publish(&ui, &state.lock().unwrap());
+            publish_videos(&ui, &state.lock().unwrap());
         }
     });
     ui.on_clear_selection({
@@ -1201,7 +1631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let search = ui.get_video_search().to_string();
             set_visible_selection(&mut state.lock().unwrap().videos, &search, false);
             state.lock().unwrap().persist();
-            publish(&ui, &state.lock().unwrap());
+            publish_videos(&ui, &state.lock().unwrap());
         }
     });
     ui.on_choose_folder({
@@ -1280,39 +1710,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 show_download_error(&ui, "Too many downloads selected.");
                 return;
             }
-            if state.lock().unwrap().jobs.len() + selected.len() > store::MAX_JOBS {
+            let added = {
+                let mut value = state.lock().unwrap();
+                let candidates = unqueued_videos(&value.jobs, selected, mode, &quality, &folder);
+                if value.jobs.len() + candidates.len() > store::MAX_JOBS {
+                    None
+                } else {
+                    let added = candidates.len();
+                    if added > 0 {
+                        value.folder = folder.clone();
+                        for video in candidates {
+                            value.jobs.push(Job {
+                                video,
+                                mode,
+                                quality: quality.clone(),
+                                folder: folder.clone(),
+                                status: JobState::Queued,
+                                percent: 0,
+                                detail: "Waiting for download slot…".into(),
+                                cancel: Arc::new(AtomicBool::new(false)),
+                            });
+                        }
+                    }
+                    // schedule() reserves all available slots and persists a
+                    // single complete snapshot *before* any worker starts.
+                    // An earlier save here duplicated synchronous disk IO.
+                    Some(added)
+                }
+            };
+            let Some(added) = added else {
                 show_download_error(
                     &ui,
                     "Queue history is full. Finish current downloads and clear history first.",
                 );
                 return;
-            }
-            let added = {
-                let mut value = state.lock().unwrap();
-                value.folder = folder.clone();
-                let mut added = 0;
-                for video in selected {
-                    if value
-                        .jobs
-                        .iter()
-                        .any(|job| is_pending_duplicate(job, &video, mode, &quality, &folder))
-                    {
-                        continue;
-                    }
-                    value.jobs.push(Job {
-                        video,
-                        mode,
-                        quality: quality.clone(),
-                        folder: folder.clone(),
-                        status: JobState::Queued,
-                        percent: 0,
-                        detail: "Waiting for download slot…".into(),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                    });
-                    added += 1;
-                }
-                value.persist();
-                added
             };
             if added == 0 {
                 show_download_error(&ui, "These videos are already queued or downloading.");
@@ -1335,12 +1766,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         move || {
             let Some(ui) = weak.upgrade() else { return };
-            for job in &mut state.lock().unwrap().jobs {
-                cancel_job(job);
+            let mut value = state.lock().unwrap();
+            let changed = value
+                .jobs
+                .iter_mut()
+                .map(cancel_job)
+                .filter(|changed| *changed)
+                .count();
+            if changed == 0 {
+                return;
             }
-            state.lock().unwrap().persist();
-            publish(&ui, &state.lock().unwrap());
-            ui.set_queue_error("".into());
+            let result = value.persist_checked();
+            publish_tasks(&ui, &value);
+            match result {
+                Ok(()) => ui.set_queue_error("".into()),
+                Err(error) => show_queue_error(
+                    &ui,
+                    format!("Cancellation requested, but could not save it for restart: {error}"),
+                ),
+            }
         }
     });
     ui.on_retry_failed({
@@ -1368,9 +1812,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     count += 1;
                 }
             }
-            state.lock().unwrap().persist();
+            if count == 0 {
+                show_error(&ui, "No failed downloads to retry.");
+                return;
+            }
             ui.set_queue_error("".into());
             show_error(&ui, format!("Retrying {count} failed download(s)."));
+            // schedule() commits the queued/active recovery states in one
+            // atomic session file before launching replacement workers.
             schedule(&ui, &state, yt_dlp, ffmpeg);
         }
     });
@@ -1380,20 +1829,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut value = state.lock().unwrap();
-            if value.active > 0 || value.jobs.iter().any(|job| job.status == JobState::Queued) {
-                show_queue_error(
-                    &ui,
-                    "Wait until the download queue is idle before clearing history.",
-                );
-                return;
-            }
-            let count = value.jobs.len();
-            value
-                .jobs
-                .retain(|job| matches!(job.status, JobState::Queued | JobState::Active));
-            let removed = count - value.jobs.len();
-            value.persist();
-            publish(&ui, &value);
+            let removed = match clear_finished_and_commit(&mut value, &store::session_path()) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    show_queue_error(&ui, error);
+                    return;
+                }
+            };
+            publish_tasks(&ui, &value);
             ui.set_queue_error("".into());
             show_error(&ui, format!("Cleared {removed} finished download records."));
         }
@@ -1409,9 +1852,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|i| value.jobs.get_mut(i))
             {
                 if cancel_job(job) {
-                    value.persist();
+                    let result = value.persist_checked();
                     publish_tasks(&ui, &value);
-                    ui.set_queue_error("".into());
+                    match result {
+                        Ok(()) => ui.set_queue_error("".into()),
+                        Err(error) => show_queue_error(
+                            &ui,
+                            format!(
+                                "Cancellation requested, but could not save it for restart: {error}"
+                            ),
+                        ),
+                    }
                 }
             }
         }
@@ -1444,7 +1895,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return;
                 }
-                value.persist();
+                // The scheduler persists this retry before starting it.
             }
             ui.set_queue_error("".into());
             schedule(&ui, &state, yt, ffmpeg);
@@ -1558,6 +2009,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod ui_state_tests {
     use super::*;
+    fn init_ui_testing() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(i_slint_backend_testing::init_integration_test_with_system_time);
+    }
     fn video(id: &str, title: &str) -> Video {
         Video {
             id: id.to_string(),
@@ -1577,6 +2032,815 @@ mod ui_state_tests {
             thumbnail: slint::Image::default(),
             selected,
         }
+    }
+
+    #[test]
+    fn thumbnail_from_visible_row_is_reused_without_reopening_a_path() {
+        let mut row = display_row("abcdefghijk", "Cached", true);
+        row.thumbnail = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(7, 3));
+        let model: ModelRc<VideoRow> = ModelRc::from(Rc::new(VecModel::from(vec![row])));
+        let images = existing_video_thumbnails(&model);
+        let reused = thumbnail_for_video("abcdefghijk", &images);
+        assert_eq!(reused.size().width, 7);
+        assert_eq!(reused.size().height, 3);
+        assert_eq!(thumbnail_for_video("invalid", &images).size().width, 0);
+    }
+
+    #[test]
+    fn identical_video_rows_skip_update_but_selection_and_metadata_changes_do_not() {
+        let mut original = display_row("abcdefghijk", "Original", false);
+        original.thumbnail = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(7, 3));
+        let mut refreshed = original.clone();
+        assert!(video_row_unchanged(&original, &refreshed));
+        refreshed.selected = true;
+        assert!(!video_row_unchanged(&original, &refreshed));
+        refreshed = original.clone();
+        refreshed.title = "Updated".into();
+        assert!(!video_row_unchanged(&original, &refreshed));
+        refreshed = original.clone();
+        refreshed.detail = "2:31".into();
+        assert!(!video_row_unchanged(&original, &refreshed));
+        refreshed = original.clone();
+        refreshed.secondary = "Published now".into();
+        assert!(!video_row_unchanged(&original, &refreshed));
+        refreshed = original.clone();
+        refreshed.id = "pqrstuvwxyz".into();
+        assert!(!video_row_unchanged(&original, &refreshed));
+        // A changed-ID thumbnail callback can replace the existing image
+        // independently of search, and the refresh path must reuse it.
+        let mut refreshed = original.clone();
+        refreshed.thumbnail = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(9, 2));
+        assert!(video_row_unchanged(&original, &refreshed));
+    }
+
+    fn task_row(job_index: i32) -> TaskRow {
+        TaskRow {
+            job_index,
+            title: format!("Video {job_index}").into(),
+            title_long: false,
+            thumbnail: slint::Image::default(),
+            detail: "Preparing download  ·  1:30".into(),
+            metadata: "Video  ·  Best quality".into(),
+            progress: 0,
+            state: "Downloading".into(),
+        }
+    }
+
+    fn queue_fixture(size: usize) -> State {
+        State {
+            jobs: (0..size)
+                .map(|i| Job {
+                    video: video(&format!("{i:011}"), "Queued download"),
+                    mode: Mode::Video,
+                    quality: "720".into(),
+                    folder: PathBuf::from(r"D:\Downloads"),
+                    status: if i < 3 {
+                        JobState::Active
+                    } else {
+                        JobState::Queued
+                    },
+                    percent: 0,
+                    detail: "Waiting".into(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                })
+                .collect(),
+            active: size.min(3),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn scheduler_never_launches_unpersisted_jobs_and_rolls_back_failed_reservations() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("schedule-failed-save-{}", std::process::id()));
+        let session = root.join("session.json");
+        std::fs::create_dir_all(&session).unwrap();
+        for (size, existing_active, slots) in [(10usize, 0usize, 1usize), (100, 1, 3), (1000, 2, 3)]
+        {
+            let mut state = queue_fixture(size);
+            state.theme = "red".into();
+            state.folder = PathBuf::from(r"D:\Downloads");
+            state.active = existing_active;
+            for (index, job) in state.jobs.iter_mut().enumerate() {
+                job.status = if index < existing_active {
+                    JobState::Active
+                } else {
+                    JobState::Queued
+                };
+                job.detail = format!("Original detail {index}");
+            }
+            let before = state
+                .jobs
+                .iter()
+                .map(|job| (job.status, job.detail.clone()))
+                .collect::<Vec<_>>();
+            // Previously schedule() ignored precisely this save error, then
+            // spawned up to three download processes despite no recovery file.
+            assert!(reserve_and_commit_jobs(&mut state, &session, slots).is_err());
+            assert_eq!(state.active, existing_active);
+            assert_eq!(
+                state
+                    .jobs
+                    .iter()
+                    .map(|job| (job.status, job.detail.clone()))
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert!(std::fs::read_dir(&root)
+                .unwrap()
+                .all(|entry| entry.unwrap().path() == session));
+        }
+        std::fs::remove_dir(&session).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn scheduler_commits_exactly_the_reserved_slots_before_launch() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("schedule-committed-{}", std::process::id()));
+        let session = root.join("session.json");
+        for (size, parallel) in [(10usize, 1usize), (100, 3), (1000, 3)] {
+            let mut state = queue_fixture(size);
+            state.theme = "red".into();
+            state.folder = PathBuf::from(r"D:\Downloads");
+            state.active = 0;
+            for (index, job) in state.jobs.iter_mut().enumerate() {
+                job.status = if index % 17 == 0 {
+                    JobState::Failed
+                } else {
+                    JobState::Queued
+                };
+                job.detail = "Waiting for slot".into();
+            }
+            let started = reserve_and_commit_jobs(&mut state, &session, parallel).unwrap();
+            assert_eq!(started.len(), parallel);
+            assert_eq!(state.active, parallel);
+            let saved = store::load(&session).unwrap().unwrap();
+            assert_eq!(saved.jobs.len(), size);
+            for (index, job) in saved.jobs.iter().enumerate() {
+                let expected = if started.iter().any(|item| item.0 == index) {
+                    store::SavedJobStatus::Queued // load() safely requeues Active
+                } else if index % 17 == 0 {
+                    store::SavedJobStatus::Failed
+                } else {
+                    store::SavedJobStatus::Queued
+                };
+                assert_eq!(job.state, expected);
+                if started.iter().any(|item| item.0 == index) {
+                    assert!(job.detail.contains("Resuming after application restart"));
+                }
+            }
+        }
+        std::fs::remove_file(&session).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn clear_history_is_atomic_with_save_and_never_loses_memory_on_failure() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("clear-transaction-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let session = root.join("session.json");
+        std::fs::create_dir(&session).unwrap();
+        for size in [10usize, 100, 1000] {
+            let mut state = queue_fixture(size);
+            state.theme = "red".into();
+            state.folder = PathBuf::from(r"D:\Downloads");
+            state.active = 0;
+            for job in &mut state.jobs {
+                job.status = JobState::Completed;
+            }
+            state.jobs[1].status = JobState::Failed;
+            state.jobs[2].status = JobState::Cancelled;
+            let original = state.jobs.iter().map(|job| job.status).collect::<Vec<_>>();
+            assert!(clear_finished_and_commit(&mut state, &session).is_err());
+            assert_eq!(
+                state.jobs.iter().map(|job| job.status).collect::<Vec<_>>(),
+                original
+            );
+        }
+        std::fs::remove_dir(&session).unwrap();
+        for size in [10usize, 100, 1000] {
+            let mut state = queue_fixture(size);
+            state.theme = "red".into();
+            state.folder = PathBuf::from(r"D:\Downloads");
+            state.active = 0;
+            for job in &mut state.jobs {
+                job.status = JobState::Completed;
+            }
+            state.jobs[1].status = JobState::Failed;
+            assert_eq!(
+                clear_finished_and_commit(&mut state, &session).unwrap(),
+                size
+            );
+            assert!(state.jobs.is_empty());
+            assert!(store::load(&session).unwrap().unwrap().jobs.is_empty());
+        }
+        std::fs::remove_file(&session).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn clear_history_refuses_active_and_queued_downloads_without_mutating() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("clear-busy-{}", std::process::id()));
+        let session = root.join("session.json");
+        let mut state = queue_fixture(100);
+        state.theme = "red".into();
+        state.folder = PathBuf::from(r"D:\Downloads");
+        let original = state.jobs.len();
+        assert!(clear_finished_and_commit(&mut state, &session).is_err());
+        assert_eq!(state.jobs.len(), original);
+        assert!(!session.exists());
+        state.active = 0;
+        for job in &mut state.jobs {
+            job.status = JobState::Completed;
+        }
+        state.jobs[7].status = JobState::Queued;
+        assert!(clear_finished_and_commit(&mut state, &session).is_err());
+        assert!(!session.exists());
+    }
+
+    #[test]
+    fn completion_updates_only_changed_rows_and_handles_filtered_membership() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        let mut state = queue_fixture(1000);
+        ui.set_queue_filter("all".into());
+        publish_tasks(&ui, &state);
+        let before = ui.get_tasks();
+        state.jobs[0].status = JobState::Completed;
+        state.jobs[0].percent = 100;
+        state.jobs[0].detail = "Saved successfully".into();
+        state.jobs[3].status = JobState::Active;
+        publish_scheduled_changes(&ui, &state, 0, &[3]);
+        let after = ui.get_tasks();
+        assert_eq!(after.row_count(), 1000);
+        assert_eq!(after.row_data(999).unwrap().state.as_str(), "Completed");
+        assert_eq!(after.row_data(996).unwrap().state.as_str(), "Downloading");
+        assert_eq!(after.row_data(500).unwrap().state.as_str(), "Queued");
+        assert_eq!(after.row_data(999).unwrap().progress, 100);
+        assert_eq!(before.row_data(999).unwrap().state.as_str(), "Completed");
+        ui.set_queue_filter("active".into());
+        publish_tasks(&ui, &state);
+        assert_eq!(ui.get_tasks().row_count(), 999);
+        let active_model = ui.get_tasks();
+        state.jobs[1].status = JobState::Completed;
+        publish_scheduled_changes(&ui, &state, 1, &[]);
+        assert_eq!(ui.get_tasks().row_count(), 998);
+        assert!(ui.get_tasks().row_data(997).is_some());
+        assert_eq!(ui.get_tasks(), active_model);
+        ui.set_queue_filter("completed".into());
+        publish_tasks(&ui, &state);
+        let completed_model = ui.get_tasks();
+        state.jobs[2].status = JobState::Completed;
+        publish_scheduled_changes(&ui, &state, 2, &[]);
+        assert_eq!(ui.get_tasks(), completed_model);
+        assert_eq!(ui.get_tasks().row_count(), 3);
+        assert_eq!(ui.get_tasks().row_data(0).unwrap().job_index, 2);
+        assert_eq!(ui.get_tasks().row_data(2).unwrap().job_index, 0);
+        ui.set_queue_filter("failed".into());
+        publish_tasks(&ui, &state);
+        let failed_model = ui.get_tasks();
+        state.jobs[3].status = JobState::Failed;
+        publish_scheduled_changes(&ui, &state, 3, &[]);
+        assert_eq!(ui.get_tasks(), failed_model);
+        assert_eq!(ui.get_tasks().row_count(), 1);
+        assert_eq!(ui.get_tasks().row_data(0).unwrap().job_index, 3);
+        ui.set_queue_filter("active".into());
+        publish_tasks(&ui, &state);
+        let before_cancel = ui.get_tasks().row_count();
+        state.jobs[4].status = JobState::Cancelled;
+        publish_scheduled_changes(&ui, &state, 4, &[]);
+        assert_eq!(ui.get_tasks().row_count(), before_cancel - 1);
+        // Slint binds the testing platform to its first test thread. Exercise
+        // search model identity in this same test instead of initializing a
+        // second platform from another concurrently scheduled Rust test.
+        verify_search_model_identity();
+    }
+
+    #[test]
+    #[ignore = "offline 10/100/1000-row completion UI benchmark"]
+    fn benchmark_queue_completion_ui_refresh() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        ui.set_queue_filter("all".into());
+        for size in [10usize, 100, 1000] {
+            let mut state = queue_fixture(size);
+            publish_tasks(&ui, &state);
+            state.jobs[0].status = JobState::Completed;
+            state.jobs[0].percent = 100;
+            state.jobs[3].status = JobState::Active;
+            let iterations = if size == 1000 { 50 } else { 200 };
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_tasks(&ui, &state);
+            }
+            let old = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_scheduled_changes(&ui, &state, 0, &[3]);
+            }
+            let new = started.elapsed();
+            println!(
+                "Queue-completion UI size={size} iterations={iterations}: rebuild={old:?}, incremental={new:?}, ratio={:.2}x",
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+            assert_eq!(ui.get_tasks().row_count(), size);
+        }
+    }
+
+    #[test]
+    #[ignore = "offline before/after benchmark of filtered queue lifecycle changes"]
+    fn benchmark_filtered_queue_lifecycle() {
+        init_ui_testing();
+        let old_ui = MainWindow::new().unwrap();
+        let new_ui = MainWindow::new().unwrap();
+        for size in [100usize, 1000] {
+            for filter in ["active", "completed", "failed"] {
+                let mut state = queue_fixture(size);
+                old_ui.set_queue_filter(filter.into());
+                new_ui.set_queue_filter(filter.into());
+                publish_tasks(&old_ui, &state);
+                publish_tasks(&new_ui, &state);
+                let transitions = 30;
+                let mut old_samples = Vec::with_capacity(transitions);
+                let mut new_samples = Vec::with_capacity(transitions);
+                for i in 0..transitions {
+                    state.jobs[i].status = if filter == "failed" {
+                        JobState::Failed
+                    } else {
+                        JobState::Completed
+                    };
+                    state.jobs[i].detail = "Finished".into();
+                    state.jobs[i].percent = 100;
+                    state.jobs[i + 3].status = JobState::Active;
+                    let started = std::time::Instant::now();
+                    publish_tasks(&old_ui, &state);
+                    old_samples.push(started.elapsed().as_micros());
+                    let started = std::time::Instant::now();
+                    publish_scheduled_changes(&new_ui, &state, i, &[i + 3]);
+                    new_samples.push(started.elapsed().as_micros());
+                    let old_rows = old_ui.get_tasks();
+                    let new_rows = new_ui.get_tasks();
+                    assert_eq!(old_rows.row_count(), new_rows.row_count());
+                    for (previous, current) in old_rows.iter().zip(new_rows.iter()) {
+                        assert_eq!(previous.job_index, current.job_index);
+                        assert_eq!(previous.state, current.state);
+                        assert_eq!(previous.progress, current.progress);
+                        assert_eq!(previous.detail, current.detail);
+                    }
+                }
+                old_samples.sort_unstable();
+                new_samples.sort_unstable();
+                println!(
+                    "filtered completion rows={size} filter={filter} events={transitions}: baseline_p50={}us baseline_p95={}us targeted_p50={}us targeted_p95={}us ratio={:.1}x",
+                    old_samples[transitions/2], old_samples[transitions*95/100],
+                    new_samples[transitions/2], new_samples[transitions*95/100],
+                    old_samples[transitions/2] as f64 / new_samples[transitions/2].max(1) as f64
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "offline queue completion: two saves plus rebuild versus one save and targeted UI"]
+    fn benchmark_queue_completion_with_persistence() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        ui.set_queue_filter("all".into());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("offline-bench-queue");
+        std::fs::create_dir_all(&root).unwrap();
+        for (size, iterations) in [(10usize, 15usize), (100, 12), (1000, 8)] {
+            let mut state = queue_fixture(size);
+            state.theme = "red".into();
+            state.folder = PathBuf::from(r"D:\Downloads");
+            state.jobs[0].status = JobState::Completed;
+            state.jobs[0].percent = 100;
+            state.jobs[3].status = JobState::Active;
+            let snapshot = state.snapshot();
+            let path = root.join(format!("completion-{size}-{}.json", std::process::id()));
+            // Warm filesystem and the Slint model before timed comparisons.
+            store::save(&path, &snapshot).unwrap();
+            publish_tasks(&ui, &state);
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                store::save(&path, &snapshot).unwrap();
+                store::save(&path, &snapshot).unwrap();
+                publish_tasks(&ui, &state);
+            }
+            let previous = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                store::save(&path, &snapshot).unwrap();
+                publish_scheduled_changes(&ui, &state, 0, &[3]);
+            }
+            let optimized = started.elapsed();
+            println!(
+                "Completion persistence+UI queue={size} iterations={iterations}: old={previous:?}, new={optimized:?}, ratio={:.2}x",
+                previous.as_secs_f64() / optimized.as_secs_f64()
+            );
+            assert_eq!(ui.get_tasks().row_count(), size);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "offline new queued/start and retry commits including real atomic session writes"]
+    fn benchmark_queue_start_retry_single_commit() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("offline-bench-start-commit");
+        std::fs::create_dir_all(&root).unwrap();
+        for size in [10usize, 100, 1000] {
+            for parallel in [1usize, 3] {
+                let mut state = queue_fixture(size);
+                state.theme = "red".into();
+                state.folder = PathBuf::from(r"D:\Downloads");
+                state.active = parallel;
+                for (index, job) in state.jobs.iter_mut().enumerate() {
+                    job.status = if index < parallel {
+                        JobState::Active
+                    } else if index % 11 == 0 {
+                        JobState::Failed
+                    } else {
+                        JobState::Queued
+                    };
+                }
+                let snapshot = state.snapshot();
+                let path = root.join(format!("launch-{size}-{parallel}.json"));
+                store::save(&path, &snapshot).unwrap();
+                let iterations = if size == 1000 { 20 } else { 30 };
+                let mut old = Vec::with_capacity(iterations);
+                let mut revised = Vec::with_capacity(iterations);
+                for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    store::save(&path, &snapshot).unwrap();
+                    store::save(&path, &snapshot).unwrap();
+                    old.push(start.elapsed().as_micros());
+                    let start = std::time::Instant::now();
+                    store::save(&path, &snapshot).unwrap();
+                    revised.push(start.elapsed().as_micros());
+                }
+                old.sort_unstable();
+                revised.sort_unstable();
+                let restored = store::load(&path).unwrap().unwrap();
+                assert_eq!(restored.jobs.len(), size);
+                assert_eq!(restored.jobs[0].state, store::SavedJobStatus::Queued);
+                assert_eq!(restored.jobs[parallel].state, snapshot.jobs[parallel].state);
+                println!(
+                    "start/retry commit queue={size} active={parallel} serialized_bytes={} p50_old={}us p95_old={}us p50_single={}us p95_single={}us ratio={:.2}x",
+                    std::fs::metadata(&path).unwrap().len(),
+                    old[iterations / 2], old[iterations * 95 / 100],
+                    revised[iterations / 2], revised[iterations * 95 / 100],
+                    old[iterations/2] as f64 / revised[iterations/2].max(1) as f64
+                );
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn progress_updates_one_filtered_task_without_rebuilding_queue_model() {
+        // Rows are displayed newest-first and filters can remove intervening
+        // job indices. The lookup must use the stable original job index.
+        let backing = Rc::new(VecModel::from(vec![task_row(9), task_row(3)]));
+        let model = ModelRc::from(backing.clone());
+        assert!(set_task_row_progress(&model, 3, 52, "3.2 MiB/s", "1:30"));
+        assert_eq!(backing.row_count(), 2);
+        assert_eq!(backing.row_data(0).unwrap().progress, 0);
+        let updated = backing.row_data(1).unwrap();
+        assert_eq!(updated.progress, 52);
+        assert_eq!(updated.detail.as_str(), "3.2 MiB/s  ·  1:30");
+        assert_eq!(updated.metadata.as_str(), "Video  ·  Best quality");
+        assert_eq!(updated.state.as_str(), "Downloading");
+        assert!(!set_task_row_progress(&model, 5, 90, "missing", "2:00"));
+        assert_eq!(backing.row_data(0).unwrap().progress, 0);
+        assert_eq!(backing.row_data(1).unwrap().progress, 52);
+    }
+
+    #[test]
+    fn progress_binary_search_handles_sparse_filtered_queue_and_missing_jobs() {
+        let backing = Rc::new(VecModel::from(vec![
+            task_row(999),
+            task_row(721),
+            task_row(333),
+            task_row(1),
+        ]));
+        let model = ModelRc::from(backing.clone());
+        for (index, position) in [(999, 0), (721, 1), (333, 2), (1, 3)] {
+            assert!(set_task_row_progress(&model, index, 64, "fast", "1:00"));
+            assert_eq!(backing.row_data(position).unwrap().progress, 64);
+        }
+        for absent in [0, 2, 334, 720, 722, 1000] {
+            assert!(!set_task_row_progress(&model, absent, 90, "absent", "1:00"));
+        }
+        for position in 0..backing.row_count() {
+            let row = backing.row_data(position).unwrap();
+            assert_eq!(row.progress, 64);
+            assert_eq!(row.detail.as_str(), "fast  ·  1:00");
+        }
+    }
+
+    #[test]
+    fn thumbnail_refresh_preserves_existing_models_selection_and_metadata() {
+        let original_rows = Rc::new(VecModel::from(vec![
+            display_row("abcdefghijk", "First title", false),
+            display_row("pqrstuvwxyz", "Second title", true),
+        ]));
+        let selected_rows = Rc::new(VecModel::from(vec![display_row(
+            "pqrstuvwxyz",
+            "Second title",
+            true,
+        )]));
+        let model = ModelRc::from(original_rows.clone());
+        let selected = ModelRc::from(selected_rows.clone());
+        let updated_image = slint::Image::from_rgba8(slint::SharedPixelBuffer::new(2, 2));
+        let changed = std::collections::HashMap::from([("pqrstuvwxyz".into(), updated_image)]);
+        apply_thumbnail_images(&[model.clone(), selected.clone()], &changed);
+        assert_eq!(original_rows.row_count(), 2);
+        let unchanged = original_rows.row_data(0).unwrap();
+        assert_eq!(unchanged.thumbnail.size().width, 0);
+        assert!(!unchanged.selected);
+        let changed_main = original_rows.row_data(1).unwrap();
+        assert_eq!(changed_main.thumbnail.size().width, 2);
+        assert_eq!(changed_main.title.as_str(), "Second title");
+        assert!(changed_main.selected);
+        let changed_selected = selected_rows.row_data(0).unwrap();
+        assert_eq!(changed_selected.thumbnail.size().width, 2);
+        assert_eq!(changed_selected.title.as_str(), "Second title");
+    }
+
+    #[test]
+    #[ignore = "offline benchmark of full visible list refresh versus six thumbnail rows"]
+    fn benchmark_visible_thumbnail_refresh() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        let state = State {
+            videos: (0..1000)
+                .map(|index| {
+                    (
+                        video(&format!("{index:011}"), "A selected channel video"),
+                        index % 50 == 0,
+                    )
+                })
+                .collect(),
+            ..State::default()
+        };
+        publish_videos(&ui, &state);
+        let changed = (0..6)
+            .map(|index| {
+                (
+                    format!("{index:011}"),
+                    slint::Image::from_rgba8(slint::SharedPixelBuffer::new(2, 2)),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let iterations = 30;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            publish_videos(&ui, &state);
+        }
+        let full_refresh = started.elapsed();
+        let videos = ui.get_videos();
+        let selected = ui.get_selected_videos();
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            apply_thumbnail_images(&[videos.clone(), selected.clone()], &changed);
+        }
+        let targeted = started.elapsed();
+        println!(
+            "Thumbnail UI update: {iterations} batches of 6 new thumbnails / 1000 video rows: full refresh {full_refresh:?}, targeted update {targeted:?}, ratio {:.1}x",
+            full_refresh.as_secs_f64() / targeted.as_secs_f64()
+        );
+        assert!(targeted < full_refresh);
+        assert_eq!(videos.row_count(), 1000);
+        assert_eq!(selected.row_count(), 20);
+    }
+
+    #[test]
+    #[ignore = "offline UI search benchmark: unnecessary queue model rebuild"]
+    fn benchmark_video_search_queue_rebuild() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        for size in [10usize, 100, 1000] {
+            let state = State {
+                videos: (0..size)
+                    .map(|i| {
+                        (
+                            video(&format!("{i:011}"), "Example channel video"),
+                            i % 20 == 0,
+                        )
+                    })
+                    .collect(),
+                jobs: (0..size)
+                    .map(|i| Job {
+                        video: video(&format!("{i:011}"), "Queued download"),
+                        mode: Mode::Video,
+                        quality: "720".into(),
+                        folder: PathBuf::from(r"D:\Downloads"),
+                        status: if i % 3 == 0 {
+                            JobState::Completed
+                        } else {
+                            JobState::Queued
+                        },
+                        percent: 0,
+                        detail: "Waiting".into(),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    })
+                    .collect(),
+                ..State::default()
+            };
+            let iterations = if size == 1000 { 15 } else { 40 };
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish(&ui, &state);
+            }
+            let full = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_videos(&ui, &state);
+            }
+            let video_only = started.elapsed();
+            println!(
+                "Video-search UI refresh rows={size} iterations={iterations}: old full={full:?}, videos-only={video_only:?}, ratio={:.2}x",
+                full.as_secs_f64() / video_only.as_secs_f64()
+            );
+            assert_eq!(ui.get_tasks().row_count(), size);
+            assert_eq!(ui.get_videos().row_count(), size);
+        }
+    }
+
+    fn verify_search_model_identity() {
+        let ui = MainWindow::new().unwrap();
+        let state = State {
+            videos: vec![
+                (video("abcdefghijk", "Rust channel video"), true),
+                (video("pqrstuvwxyz", "Music channel video"), false),
+            ],
+            jobs: queue_fixture(2).jobs,
+            ..State::default()
+        };
+        publish(&ui, &state);
+        let selected_model = ui.get_selected_videos();
+        let queue_model = ui.get_tasks();
+        let mut review_row = selected_model.row_data(0).unwrap();
+        review_row.detail = "Unchanged review row".into();
+        selected_model.set_row_data(0, review_row);
+        ui.set_video_search("Music".into());
+        publish_filtered_videos(&ui, &state);
+        assert_eq!(ui.get_videos().row_count(), 1);
+        assert_eq!(
+            ui.get_videos().row_data(0).unwrap().id.as_str(),
+            "pqrstuvwxyz"
+        );
+        assert_eq!(ui.get_selected_videos().row_count(), 1);
+        assert_eq!(
+            ui.get_selected_videos()
+                .row_data(0)
+                .unwrap()
+                .detail
+                .as_str(),
+            "Unchanged review row"
+        );
+        assert_eq!(ui.get_tasks().row_count(), 2);
+        assert_eq!(
+            queue_model.row_data(0).unwrap().job_index,
+            ui.get_tasks().row_data(0).unwrap().job_index
+        );
+    }
+
+    #[test]
+    #[ignore = "offline UI search benchmark with 100/1000 selected thumbnails"]
+    fn benchmark_search_without_selected_review_rebuild() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        for (size, selected_step) in [(100usize, 1), (1000, 10), (1000, 1)] {
+            let state = State {
+                videos: (0..size)
+                    .map(|i| {
+                        (
+                            video(&format!("{i:011}"), "Example channel video"),
+                            i % selected_step == 0,
+                        )
+                    })
+                    .collect(),
+                ..State::default()
+            };
+            publish_videos(&ui, &state);
+            let iterations = if size == 1000 { 15 } else { 40 };
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_videos(&ui, &state);
+            }
+            let old = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_filtered_videos(&ui, &state);
+            }
+            let new = started.elapsed();
+            println!(
+                "Search selected-review rows={size}, selected={}: full={old:?}, filtered-only={new:?}, ratio={:.2}x",
+                size / selected_step,
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "offline 100/1000 JPEG thumbnail benchmark; requires isolated LOCALAPPDATA cache fixture"]
+    fn benchmark_existing_cached_thumbnail_reuse() {
+        init_ui_testing();
+        let ui = MainWindow::new().unwrap();
+        ui.set_video_search("".into());
+        assert!(
+            thumbnails::cached("00000000000").is_some(),
+            "create 00000000000.jpg in an isolated LOCALAPPDATA thumbnail directory"
+        );
+        for (size, iterations) in [(100usize, 6usize), (1000, 3)] {
+            let state = State {
+                videos: (0..size)
+                    .map(|i| (video(&format!("{i:011}"), "Cached thumbnail video"), false))
+                    .collect(),
+                ..State::default()
+            };
+            publish_filtered_videos(&ui, &state);
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                // Exact previous steady-state path: same row IDs and count,
+                // load cached images anew and set individual VecModel rows.
+                // In production the prefix-identity branch is also used for
+                // repeated searches that retain the visible row membership.
+                let rows = state
+                    .videos
+                    .iter()
+                    .map(|(video, selected)| VideoRow {
+                        id: video.id.clone().into(),
+                        title: video.title.clone().into(),
+                        title_long: false,
+                        detail: video.duration.clone().into(),
+                        secondary: state.channel_name.clone().into(),
+                        thumbnail: thumbnails::cached(&video.id)
+                            .and_then(|path| slint::Image::load_from_path(&path).ok())
+                            .unwrap_or_default(),
+                        selected: *selected,
+                    })
+                    .collect::<Vec<_>>();
+                let model = ui.get_videos();
+                for (index, row) in rows.into_iter().enumerate() {
+                    model.set_row_data(index, row);
+                }
+            }
+            let old = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                publish_filtered_videos(&ui, &state);
+            }
+            let new = started.elapsed();
+            println!(
+                "Cached JPEG video search rows={size} iterations={iterations}: previous={old:?}, reused-row-images={new:?}, ratio={:.2}x",
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+            assert_eq!(ui.get_videos().row_count(), size);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual, repeatable 1,000-task queue update performance proxy"]
+    fn benchmark_queue_progress_model_rebuild_vs_single_row() {
+        // Conservative local proxy: model rebuilding and per-row clones only.
+        // Production's old path also decoded cached images and counted jobs.
+        const ROWS: i32 = 1_000;
+        const UPDATES: usize = 500;
+        let rows = (0..ROWS).rev().map(task_row).collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        for _ in 0..UPDATES {
+            let model = ModelRc::from(Rc::new(VecModel::from(rows.clone())));
+            std::hint::black_box(model.row_count());
+        }
+        let rebuild = started.elapsed();
+        let model = ModelRc::from(Rc::new(VecModel::from(rows)));
+        let started = std::time::Instant::now();
+        for percent in 0..UPDATES {
+            assert!(set_task_row_progress(
+                &model,
+                (ROWS - 1) as usize,
+                (percent % 101) as i32,
+                "3.2 MiB/s",
+                "1:30",
+            ));
+        }
+        let targeted = started.elapsed();
+        println!(
+            "Queue proxy: {UPDATES} progress events, {ROWS} rows: full model rebuild {rebuild:?}, single-row updates {targeted:?}, ratio {:.1}x",
+            rebuild.as_secs_f64() / targeted.as_secs_f64()
+        );
     }
 
     #[test]
@@ -1689,6 +2953,76 @@ mod ui_state_tests {
             .iter()
             .all(|(_, selected)| !selected));
     }
+
+    #[test]
+    fn large_channel_refresh_retains_selection_across_page_boundaries() {
+        let old = (0..1000)
+            .map(|index| (video(&format!("{index:011}"), "Old"), index % 7 == 0))
+            .collect::<Vec<_>>();
+        let incoming = (790..1000)
+            .map(|index| video(&format!("{index:011}"), "Updated"))
+            .collect::<Vec<_>>();
+        let result = reconcile_videos(&old, incoming, true);
+        assert_eq!(result.len(), 210);
+        for (index, (video, selected)) in (790..1000).zip(result.iter()) {
+            assert_eq!(video.id, format!("{index:011}"));
+            assert_eq!(*selected, index % 7 == 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "offline selection restoration benchmark at multiple library sizes"]
+    fn benchmark_channel_selection_reconciliation() {
+        for size in [10usize, 100, 1000] {
+            let old = (0..size)
+                .map(|index| (video(&format!("{index:011}"), "Existing"), index % 7 == 0))
+                .collect::<Vec<_>>();
+            let incoming = (size.saturating_sub(200)..size)
+                .map(|index| video(&format!("{index:011}"), "Updated"))
+                .collect::<Vec<_>>();
+            let iterations = if size == 1000 { 200 } else { 1000 };
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(
+                    incoming
+                        .iter()
+                        .cloned()
+                        .map(|video| {
+                            let selected = old
+                                .iter()
+                                .any(|(saved, selected)| saved.id == video.id && *selected);
+                            (video, selected)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let linear = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(reconcile_videos(&old, incoming.clone(), true));
+            }
+            let indexed = started.elapsed();
+            println!(
+                "Selection reconciliation: saved={size}, incoming={}, iterations={iterations}, linear={linear:?}, indexed={indexed:?}, ratio={:.2}x",
+                incoming.len(),
+                linear.as_secs_f64() / indexed.as_secs_f64(),
+            );
+            let expected = incoming
+                .iter()
+                .map(|video| {
+                    old.iter()
+                        .any(|(saved, selected)| saved.id == video.id && *selected)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reconcile_videos(&old, incoming, true)
+                    .iter()
+                    .map(|(_, selected)| *selected)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
     #[test]
     fn bulk_selection_only_affects_visible_filtered_titles() {
         let mut rows = vec![
@@ -1741,6 +3075,41 @@ mod ui_state_tests {
     }
 
     #[test]
+    fn cancelling_active_download_stays_cancelled_after_restart() {
+        let make_job = |id: &str| Job {
+            video: video(id, "Download"),
+            mode: Mode::Video,
+            quality: "720".into(),
+            folder: PathBuf::from(r"C:\Downloads"),
+            status: JobState::Active,
+            percent: 32,
+            detail: "Downloading".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let mut state = State {
+            theme: "red".into(),
+            folder: PathBuf::from(r"C:\Downloads"),
+            jobs: vec![make_job("abcdefghijk"), make_job("defghijklmn")],
+            ..State::default()
+        };
+        assert!(cancel_job(&mut state.jobs[0]));
+        assert_eq!(state.jobs[0].status, JobState::Active);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.jobs[0].state, store::SavedJobStatus::Cancelled);
+        assert_eq!(snapshot.jobs[0].detail, "Cancelled by user.");
+        assert_eq!(snapshot.jobs[1].state, store::SavedJobStatus::Active);
+
+        let dir = std::env::temp_dir().join(format!("ycd-cancel-restart-{}", std::process::id()));
+        let path = dir.join("session.json");
+        store::save(&path, &snapshot).unwrap();
+        let restored = store::load(&path).unwrap().unwrap();
+        assert_eq!(restored.jobs[0].state, store::SavedJobStatus::Cancelled);
+        assert_eq!(restored.jobs[1].state, store::SavedJobStatus::Queued);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
     fn queued_duplicate_detection_includes_destination_folder() {
         let video = video("abcdefghijk", "One");
         let source = PathBuf::from(r"C:\Downloads\One");
@@ -1784,6 +3153,145 @@ mod ui_state_tests {
             "720",
             &source
         ));
+    }
+
+    #[test]
+    fn queue_capacity_counts_only_new_jobs_after_duplicate_filtering() {
+        let folder = PathBuf::from(r"C:\Downloads");
+        let jobs = (0..store::MAX_JOBS - 1)
+            .map(|index| Job {
+                video: video(&format!("{index:011}"), "Previous"),
+                mode: Mode::Video,
+                quality: "best".into(),
+                folder: folder.clone(),
+                status: if index == 0 {
+                    JobState::Active
+                } else {
+                    JobState::Completed
+                },
+                percent: 0,
+                detail: String::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            })
+            .collect::<Vec<_>>();
+        let selected = vec![
+            video("00000000000", "Already active"),
+            video("abcdefghijk", "New"),
+        ];
+        assert!(jobs.len() + selected.len() > store::MAX_JOBS);
+        let candidates = unqueued_videos(&jobs, selected, Mode::Video, "best", &folder);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "abcdefghijk");
+        assert_eq!(jobs.len() + candidates.len(), store::MAX_JOBS);
+    }
+
+    #[test]
+    fn indexed_queue_matching_preserves_format_destination_and_status_rules() {
+        let folder = PathBuf::from(r"C:\Downloads");
+        let other_folder = PathBuf::from(r"C:\Other");
+        let mut active = Job {
+            video: video("abcdefghijk", "Existing"),
+            mode: Mode::Video,
+            quality: "720".into(),
+            folder: folder.clone(),
+            status: JobState::Active,
+            percent: 30,
+            detail: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let selected = vec![
+            video("abcdefghijk", "Existing"),
+            video("pqrstuvwxyz", "New"),
+        ];
+        let selected_ids = |jobs: &[Job], mode, quality, path: &PathBuf| {
+            unqueued_videos(jobs, selected.clone(), mode, quality, path)
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected_ids(&[active], Mode::Video, "720", &folder),
+            vec!["pqrstuvwxyz"]
+        );
+        active = Job {
+            video: video("abcdefghijk", "Existing"),
+            mode: Mode::Video,
+            quality: "720".into(),
+            folder: folder.clone(),
+            status: JobState::Active,
+            percent: 30,
+            detail: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        for (mode, quality, destination, status) in [
+            (Mode::Video, "1080", &folder, JobState::Active),
+            (Mode::Audio, "720", &folder, JobState::Active),
+            (Mode::Video, "720", &other_folder, JobState::Active),
+            (Mode::Video, "720", &folder, JobState::Completed),
+            (Mode::Video, "720", &folder, JobState::Cancelled),
+        ] {
+            active.status = status;
+            assert_eq!(
+                selected_ids(std::slice::from_ref(&active), mode, quality, destination),
+                vec!["abcdefghijk", "pqrstuvwxyz"]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual offline 10/100/1000 job duplicate-matching comparison"]
+    fn benchmark_indexed_queue_duplicate_matching() {
+        let folder = PathBuf::from(r"C:\Downloads");
+        for (size, iterations) in [(10usize, 1000usize), (100, 200), (1000, 20)] {
+            let jobs = (0..size)
+                .map(|index| Job {
+                    video: video(&format!("{index:011}"), "Existing"),
+                    mode: Mode::Video,
+                    quality: "720".into(),
+                    folder: folder.clone(),
+                    status: JobState::Queued,
+                    percent: 0,
+                    detail: String::new(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                })
+                .collect::<Vec<_>>();
+            let selected = jobs.iter().map(|job| job.video.clone()).collect::<Vec<_>>();
+            // The exact pre-fix matching operation, kept only as a benchmark.
+            let old = |selection: Vec<Video>| {
+                selection
+                    .into_iter()
+                    .filter(|video| {
+                        !jobs.iter().any(|job| {
+                            is_pending_duplicate(job, video, Mode::Video, "720", &folder)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(old(selected.clone()));
+            }
+            let linear = start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(unqueued_videos(
+                    &jobs,
+                    selected.clone(),
+                    Mode::Video,
+                    "720",
+                    &folder,
+                ));
+            }
+            let indexed = start.elapsed();
+            println!(
+                "Duplicate matching {size} history + {size} selections x{iterations}: linear {linear:?}, indexed {indexed:?}, ratio {:.1}x",
+                linear.as_secs_f64() / indexed.as_secs_f64()
+            );
+            assert_eq!(
+                old(selected.clone()),
+                unqueued_videos(&jobs, selected, Mode::Video, "720", &folder)
+            );
+        }
     }
 
     #[test]
