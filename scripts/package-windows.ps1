@@ -273,7 +273,7 @@ try {
     $ytDlpLicense = Join-Path $stage 'yt-dlp-LICENSE.txt'
     $denoLicense = Join-Path $stage 'deno-LICENSE.txt'
     Download-LicenseText 'https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/LICENSE' $ytDlpLicense '(?i)(public domain|unlicense)'
-    Download-LicenseText 'https://raw.githubusercontent.com/denoland/deno/main/LICENSE' $denoLicense '(?i)MIT License'
+    Download-LicenseText 'https://raw.githubusercontent.com/denoland/deno/main/LICENSE.md' $denoLicense '(?i)MIT License'
 
     $ffmpegLicense = [IO.File]::ReadAllText((Join-Path $bin 'FFmpeg-LICENSE.txt'))
     if ($ffmpegLicense.Length -lt 1000 -or $ffmpegLicense -notmatch '(?i)FFmpeg') {
