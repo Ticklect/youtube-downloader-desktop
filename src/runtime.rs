@@ -103,6 +103,30 @@ fn digest_hex(bytes: &[u8]) -> String {
     hex(&digest)
 }
 
+fn digest_file(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!(
+            "Cannot read embedded runtime file {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            format!(
+                "Cannot hash embedded runtime file {}: {error}",
+                path.display()
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -219,6 +243,17 @@ fn expected_manifest(
                 entry.name
             ));
         }
+        // Do not trust the cache manifest alone: it contains the expected
+        // payload digest, not proof that the on-disk executable still matches.
+        // Hash the existing bytes on every reuse so same-length corruption or
+        // a modified file with a preserved timestamp cannot pass validation.
+        let actual_sha256 = digest_file(&path)?;
+        if actual_sha256 != entry.sha256 {
+            return Err(format!(
+                "Embedded runtime file {} failed its SHA-256 check.",
+                entry.name
+            ));
+        }
         let modified = metadata
             .modified()
             .map_err(|_| format!("Cannot inspect embedded runtime file {}.", entry.name))?;
@@ -235,7 +270,7 @@ fn expected_manifest(
             "{}\t{}\t{}\t{}\n",
             entry.name,
             entry.uncompressed_len,
-            hex(&entry.sha256),
+            hex(&actual_sha256),
             ticks
         ));
     }
@@ -459,6 +494,21 @@ mod tests {
         let second = ensure_runtime_at(&payload, &root, "ab12cd34").unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_length_cache_corruption_is_rejected() {
+        let root = test_root("cache-corruption");
+        let payload = make_payload(&sample_files());
+        let directory = ensure_runtime_at(&payload, &root, "ab12cd34").unwrap();
+        let tool = directory.join(REQUIRED_TOOLS[0]);
+        let mut bytes = fs::read(&tool).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&tool, &bytes).unwrap();
+
+        let error = ensure_runtime_at(&payload, &root, "ab12cd34").unwrap_err();
+        assert!(error.contains("SHA-256 check"), "unexpected error: {error}");
         fs::remove_dir_all(root).unwrap();
     }
 
