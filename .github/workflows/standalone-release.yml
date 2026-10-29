@@ -1,0 +1,152 @@
+name: Standalone Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: New immutable release tag, for example standalone-beta-20261029
+        required: true
+        type: string
+      publish_release:
+        description: Publish a new latest release on master after verification
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-windows-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Validate manual dispatch and immutable tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          if ($env:GITHUB_REF -ne 'refs/heads/master') {
+            throw 'Dispatch this workflow from master after the standalone runtime changes have been merged.'
+          }
+          if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$') {
+            throw 'release_tag must be 1-40 ASCII letters, digits, periods, underscores or hyphens.'
+          }
+          if ($env:PUBLISH_RELEASE -eq 'true') {
+            $existing = & git ls-remote --tags "https://github.com/$env:GITHUB_REPOSITORY.git" "refs/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to verify whether the requested release tag already exists.' }
+            if ($existing) { throw "Refusing to replace existing tag $env:RELEASE_TAG." }
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Unit tests
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build verified standalone EXE
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: ./scripts/package-windows.ps1 -Tag $env:RELEASE_TAG
+
+      - name: Stage artifact and calculate executable SHA-256
+        id: artifact
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\YouTube Downloader Desktop Beta $env:RELEASE_TAG.exe"
+          $notices = Join-Path $env:GITHUB_WORKSPACE "dist\THIRD-PARTY-NOTICES $env:RELEASE_TAG.txt"
+          foreach ($path in @($exe, $notices)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required release artifact missing: $path" }
+          }
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpperInvariant()
+          $checksum = Join-Path $env:GITHUB_WORKSPACE "dist\SHA256SUMS $env:RELEASE_TAG.txt"
+          [IO.File]::WriteAllText($checksum, "$hash  youtubedownloderbeta.exe`r`n", (New-Object Text.UTF8Encoding($false)))
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+          "notices=$notices" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Host "Standalone EXE SHA-256: $hash"
+
+      - name: Upload verified build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ inputs.release_tag }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ steps.artifact.outputs.exe }}
+            ${{ steps.artifact.outputs.notices }}
+            ${{ steps.artifact.outputs.checksum }}
+
+      - name: Prepare immutable release assets
+        id: publish
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_EXE: ${{ steps.artifact.outputs.exe }}
+          SOURCE_NOTICES: ${{ steps.artifact.outputs.notices }}
+          EXE_SHA256: ${{ steps.artifact.outputs.sha256 }}
+        run: |
+          $publish = Join-Path $env:RUNNER_TEMP ('publish-' + $env:RELEASE_TAG)
+          New-Item -ItemType Directory -Path $publish | Out-Null
+          $exe = Join-Path $publish 'youtubedownloderbeta.exe'
+          $notices = Join-Path $publish 'THIRD-PARTY-NOTICES.txt'
+          Copy-Item -LiteralPath $env:SOURCE_EXE -Destination $exe
+          Copy-Item -LiteralPath $env:SOURCE_NOTICES -Destination $notices
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpperInvariant() -ne $env:EXE_SHA256) {
+            throw 'Staged release executable SHA-256 changed.'
+          }
+          $notes = Join-Path $publish 'release-notes.md'
+          $body = @(
+            'Standalone Windows x64 build from master.',
+            '',
+            '- The EXE embeds yt-dlp, FFmpeg, FFprobe, and Deno.',
+            '- Upstream runtime archives were checked against their published SHA-256 values before embedding.',
+            ('- Executable SHA-256: ' + $env:EXE_SHA256),
+            '- Third-party license texts and attributions are attached separately.',
+            '- This build is not Authenticode-signed; Windows may show a publisher or reputation warning.'
+          ) -join "`n"
+          [IO.File]::WriteAllText($notes, $body, (New-Object Text.UTF8Encoding($false)))
+          "publish_dir=$publish" >> $env:GITHUB_OUTPUT
+
+      - name: Publish new latest release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PUBLISH_DIR: ${{ steps.publish.outputs.publish_dir }}
+        run: |
+          # The preflight check rejects existing tags. Do not use --clobber or
+          # update an existing release: every dispatch publishes a new tag.
+          & gh release create $env:RELEASE_TAG `
+            (Join-Path $env:PUBLISH_DIR 'youtubedownloderbeta.exe') `
+            (Join-Path $env:PUBLISH_DIR 'THIRD-PARTY-NOTICES.txt') `
+            --title "YouTube Downloader Desktop Beta $env:RELEASE_TAG" `
+            --notes-file (Join-Path $env:PUBLISH_DIR 'release-notes.md') `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed with exit code $LASTEXITCODE." }

@@ -27,6 +27,39 @@ fn windows_resource_compiler() -> PathBuf {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=YTD_EMBEDDED_RUNTIME_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=YTD_RUNTIME_PAYLOAD_SHA256");
+    println!("cargo:rerun-if-env-changed=YTD_REQUIRE_EMBEDDED_RUNTIME");
+
+    // A normal developer build remains possible without the large runtime
+    // bundle. The standalone packaging path opts into fail-closed behaviour.
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let embedded_payload = env::var_os("YTD_EMBEDDED_RUNTIME_PAYLOAD").map(PathBuf::from);
+    let require_payload = env::var("YTD_REQUIRE_EMBEDDED_RUNTIME").as_deref() == Ok("1");
+    let payload_output = out_dir.join("runtime-payload.bin");
+    let payload_hash = env::var("YTD_RUNTIME_PAYLOAD_SHA256").unwrap_or_default();
+    if let Some(source) = embedded_payload.filter(|path| path.is_file()) {
+        println!("cargo:rerun-if-changed={}", source.display());
+        let metadata = fs::metadata(&source).expect("runtime payload metadata must be readable");
+        assert!(metadata.len() > 12, "runtime payload is empty or truncated");
+        if require_payload {
+            assert!(
+                payload_hash.len() == 64
+                    && payload_hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "standalone packaging requires the payload SHA-256"
+            );
+        }
+        fs::copy(&source, &payload_output).expect("runtime payload must be copied to OUT_DIR");
+        println!("cargo:rustc-env=YTD_RUNTIME_PAYLOAD_SHA256={payload_hash}");
+    } else {
+        assert!(
+            !require_payload,
+            "standalone packaging requested but YTD_EMBEDDED_RUNTIME_PAYLOAD is missing"
+        );
+        fs::write(&payload_output, []).expect("empty development payload must be created");
+        println!("cargo:rustc-env=YTD_RUNTIME_PAYLOAD_SHA256=");
+    }
+
     slint_build::compile("ui/main.slint").expect("Slint UI must compile");
 
     println!("cargo:rerun-if-changed=assets/windows-icon.rc");

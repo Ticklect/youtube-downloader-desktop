@@ -12,13 +12,15 @@ The demo shows selecting videos from a channel, choosing video or audio formats 
 
 ## Install
 
-1. Open the [latest Desktop Beta release](https://github.com/Ticklect/youtube-downloader-desktop/releases/latest) and download the **Windows x64 ZIP**.
-2. Right-click the ZIP and choose **Extract All**. Do not run the app from inside the ZIP.
-3. Open the extracted folder and run **`YouTube Downloader Desktop.exe`**.
+1. Open the [latest Desktop Beta release](https://github.com/Ticklect/youtube-downloader-desktop/releases/latest) and download the standalone Windows x64 EXE.
+2. Run **`youtubedownloderbeta.exe`**. The standalone build embeds yt-dlp, FFmpeg, FFprobe, and Deno; you do not need to download those tools or keep a `bin` folder beside the EXE.
+3. Keep the accompanying third-party notices file with the EXE; it contains the bundled tools' license texts and attributions.
 
-Keep the `bin` folder beside the EXE. It contains the tools the app needs to download and process media. The portable download does **not** require a separate installation of Rust, Python, FFmpeg, or yt-dlp.
+On first launch, the app extracts the embedded tools into a versioned directory under `%LOCALAPPDATA%\YouTube Downloader Desktop\tools\`. This is separate from the saved session and thumbnail cache, so updating or extracting the runtime does not reset your settings, saved channels, selected videos, or download history. The app does not require a separate installation of Rust, Python, FFmpeg, or yt-dlp.
 
-The Beta is currently **Windows x64 only**. It is not code-signed and has no installer, so Windows may show an unrecognized-app warning. Only run files you trust; the release includes a `SHA256SUMS.txt` file if you want to verify the ZIP.
+The Beta is currently **Windows x64 only**. It has no installer and is not Authenticode-signed, so Windows may show a publisher or reputation warning. Only run an EXE obtained from a source you trust and verify its published SHA-256 when one is provided. Signing would require a trusted code-signing certificate; bundling dependencies does not remove Windows trust warnings.
+
+Older Windows x64 ZIP packages contain the EXE and a separate `bin` directory. They are legacy portable packages and are **not** the standalone single-EXE build described above.
 
 ## How to use it
 
@@ -57,7 +59,7 @@ The main Library screenshot shows a real public channel with **259 videos loaded
 | Audio | MP3 output |
 | Captions | English captions, if available for the video |
 | Downloads | Folder selection, progress, cancellation, retry, and history |
-| Processing | Local yt-dlp, FFmpeg, and Deno tools included in the portable ZIP |
+| Processing | yt-dlp, FFmpeg, FFprobe, and Deno embedded in the standalone EXE and extracted locally on first launch |
 
 Some uploads, formats, or captions may not be available. YouTube can change how videos are delivered, so not every download will succeed. Private, members-only, login-restricted, and DRM-protected content are not supported. This is a **Beta**, not a guarantee of uninterrupted downloads.
 
@@ -81,14 +83,15 @@ The desktop app is written in **Rust** and uses **Slint** for its native UI. On 
 cargo fmt --all -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo build --release --locked
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Tag Local-Build
 ```
 
-The packaging script downloads and checksum-verifies the required tools. It creates a portable folder and ZIP under `dist/`, and refuses to overwrite an existing build with the same tag. To run the Windows GUI smoke tests against that package:
+The packaging script downloads and checksum-verifies the upstream tool assets, freshly extracts the verified archives, builds a raw-DEFLATE payload, and passes its path and SHA-256 into a required embedded-runtime release build. It creates a standalone EXE and a `THIRD-PARTY-NOTICES Local-Build.txt` file under `dist/`. Output names are immutable: the script refuses to overwrite an existing output, so use a new `-Tag` for each package. Packaging requires network access to the upstream release and checksum URLs.
+
+To run the Windows GUI smoke tests against that EXE:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-beta-acceptance.ps1 -Executable 'dist\YouTube Downloader Desktop Beta Local-Build\YouTube Downloader Desktop.exe' -CaptureMatrix
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-beta-acceptance.ps1 -Executable 'dist\YouTube Downloader Desktop Beta Local-Build.exe' -CaptureMatrix
 ```
 
 Those tests use isolated sample data, not your real downloaded files. Your regular app settings and history are stored under `%LOCALAPPDATA%\YouTube Downloader Desktop\`.
@@ -97,4 +100,4 @@ Those tests use isolated sample data, not your real downloaded files. Your regul
 
 A separate **browser-only extension** is being developed as an alternative for people who do not want a desktop app. It is experimental, has different download limitations, and is **not included in this repository or release**. The old extension-plus-Python-helper project is retired; its source remains in Git history, not in the current desktop codebase.
 
-This project's source is licensed under **[AGPL-3.0](LICENSE)**. The UI uses [Slint](https://slint.dev/) and includes its attribution under **About & legal**. Bundled yt-dlp, FFmpeg, and Deno have their own upstream licence terms and notices.
+This project's source is licensed under **[AGPL-3.0](LICENSE)**. The UI uses [Slint](https://slint.dev/) and includes its attribution under **About & legal**. The standalone package accompanies the complete project license and license texts for yt-dlp, FFmpeg, and Deno in its third-party notices file. See [third-party notices and upstream sources](docs/THIRD-PARTY-NOTICES.md) for attribution and license source links.
