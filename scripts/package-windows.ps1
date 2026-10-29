@@ -276,7 +276,12 @@ try {
     Download-LicenseText 'https://raw.githubusercontent.com/denoland/deno/main/LICENSE.md' $denoLicense '(?i)MIT License'
 
     $ffmpegLicense = [IO.File]::ReadAllText((Join-Path $bin 'FFmpeg-LICENSE.txt'))
-    if ($ffmpegLicense.Length -lt 1000 -or $ffmpegLicense -notmatch '(?i)FFmpeg') {
+    # Gyan's essentials archive supplies the applicable GPL text, which is the
+    # GNU GPL itself and does not need to mention FFmpeg by name. Validate the
+    # actual license markers rather than incorrectly expecting the project name.
+    if ($ffmpegLicense.Length -lt 1000 -or
+        $ffmpegLicense -notmatch '(?i)GNU GENERAL PUBLIC LICENSE' -or
+        $ffmpegLicense -notmatch '(?i)Version 3') {
         throw 'The extracted FFmpeg license text failed validation.'
     }
 

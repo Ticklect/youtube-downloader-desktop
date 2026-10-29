@@ -109,16 +109,23 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_EXE: ${{ steps.artifact.outputs.exe }}
           SOURCE_NOTICES: ${{ steps.artifact.outputs.notices }}
+          SOURCE_CHECKSUM: ${{ steps.artifact.outputs.checksum }}
           EXE_SHA256: ${{ steps.artifact.outputs.sha256 }}
         run: |
           $publish = Join-Path $env:RUNNER_TEMP ('publish-' + $env:RELEASE_TAG)
           New-Item -ItemType Directory -Path $publish | Out-Null
           $exe = Join-Path $publish 'youtubedownloderbeta.exe'
           $notices = Join-Path $publish 'THIRD-PARTY-NOTICES.txt'
+          $checksum = Join-Path $publish 'SHA256SUMS.txt'
           Copy-Item -LiteralPath $env:SOURCE_EXE -Destination $exe
           Copy-Item -LiteralPath $env:SOURCE_NOTICES -Destination $notices
+          Copy-Item -LiteralPath $env:SOURCE_CHECKSUM -Destination $checksum
           if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpperInvariant() -ne $env:EXE_SHA256) {
             throw 'Staged release executable SHA-256 changed.'
+          }
+          $expectedChecksumLine = "$($env:EXE_SHA256)  youtubedownloderbeta.exe"
+          if ((Get-Content -LiteralPath $checksum -Raw).Trim() -ne $expectedChecksumLine) {
+            throw 'Staged release checksum asset does not match the executable.'
           }
           $notes = Join-Path $publish 'release-notes.md'
           $body = @(
@@ -146,6 +153,7 @@ jobs:
           & gh release create $env:RELEASE_TAG `
             (Join-Path $env:PUBLISH_DIR 'youtubedownloderbeta.exe') `
             (Join-Path $env:PUBLISH_DIR 'THIRD-PARTY-NOTICES.txt') `
+            (Join-Path $env:PUBLISH_DIR 'SHA256SUMS.txt') `
             --title "YouTube Downloader Desktop Beta $env:RELEASE_TAG" `
             --notes-file (Join-Path $env:PUBLISH_DIR 'release-notes.md') `
             --latest
