@@ -2,13 +2,11 @@
 
 **Windows x64 | Beta | Free and open source**
 
-A Windows app for finding videos on a public YouTube channel, choosing what to save, and downloading permitted videos, audio, or available captions. It runs on your PC; you do not need a browser extension, Python, or an account with this project.
+A native Windows app for browsing public YouTube channels and saving permitted videos, MP3 audio, or available captions. Paste a channel link to browse uploads, or paste a video or Shorts link to go straight to download settings.
 
-[![Watch YouTube Downloader Desktop in action — 20-second demo](docs/media/desktop-demo-poster.jpg)](https://github.com/Ticklect/youtube-downloader-desktop/releases/download/desktop-beta-lazy-loading/YouTube-Downloader-Desktop-Demo.mp4)
+**[Download the published Desktop Beta](https://github.com/Ticklect/youtube-downloader-desktop/releases/latest)** · [Screenshots](#screenshots)
 
-**[Watch or download the 20-second demo](https://github.com/Ticklect/youtube-downloader-desktop/releases/download/desktop-beta-lazy-loading/YouTube-Downloader-Desktop-Demo.mp4)** | **[Download the Desktop Beta](https://github.com/Ticklect/youtube-downloader-desktop/releases/latest)** | [See download options](docs/screenshots/options.png)
-
-The demo shows selecting videos from a channel, choosing video or audio formats and download quality, and managing downloads in the native Windows app.
+The walkthrough and screenshots below show the current source tree. The published Beta may be an earlier build.
 
 ## Install
 
@@ -24,46 +22,45 @@ Older Windows x64 ZIP packages contain the EXE and a separate `bin` directory. T
 
 ## How to use it
 
-1. Copy a public YouTube channel address, such as `https://www.youtube.com/@ChannelName/videos`.
-2. Paste it into the **Library** page and click **Load channel**.
-3. After browsing channels, use **From your searches** to add a channel to the **Saved channels** bar. Open a saved channel again in one click, or remove it from the bar. Suggestions come from successfully loaded channels on this computer and are ranked from your search history; they are not endorsements or live YouTube recommendations.
-4. Tick the videos you want to save. Use the search box to narrow the list.
-5. Click **Continue**, then choose the download folder, format, and quality.
-6. Start the downloads. Open **Downloads** to check progress, open finished files, cancel active jobs, or retry failures.
+1. Paste a public YouTube channel, video, Shorts, or `youtu.be` link into **Library**, then click **Load channel or video**.
+2. For a channel, select the videos you want and click **Continue**. The title filter searches loaded uploads. **Load more videos** works while the filter is active. A single-video link goes straight to **Download settings**.
+3. Choose Video, Audio MP3, or Captions and a save location. Video downloads also offer a quality setting.
+4. Click **Start downloads**. In **Downloads**, you can check progress, retry a failure, cancel a job, and reveal a newly completed file with **Show in folder**. Earlier records still offer **Open folder**.
 
-You can also switch between the **YouTube Red** and **Mono** themes. Theme and fullscreen controls are in the compact footer. The app remembers your current channel, selected videos, saved channels, settings, and download history between launches.
+Use **From your searches** to pin frequently visited channels to the **Saved** shelf. Suggestions come from successful channel loads on this computer. The footer lets you switch between **YouTube Red** and **Mono** or enter fullscreen.
 
 ## Screenshots
 
-**Library — browse a channel and select the videos you want:**
+**Library**
 
-![YouTube Downloader Desktop Beta browsing 259 videos from a public channel](docs/screenshots/library.png)
+![Video library with thumbnail cards, title filtering, and selection actions](docs/screenshots/library.png)
 
 | Download options | Downloads and history |
 | :---: | :---: |
 | ![Choose video quality, audio, captions, and destination](docs/screenshots/options.png) | ![View completed downloads, failed jobs, and retry controls](docs/screenshots/downloads.png) |
 
-**Mono theme** — the same Library with a neutral colour scheme:
+**Mono theme at minimum window size**
 
 ![YouTube Downloader Desktop Beta in Mono theme](docs/screenshots/mono-library.png)
 
-The main Library screenshot shows a real public channel with **259 videos loaded** during pagination testing. The other screenshots use isolated example data. These screenshots and the demo show an earlier Beta layout; the current Beta has a smaller top navigation area and a saved channels shelf.
+Screenshots use isolated sample data.
 
 ## What it supports
 
 | Feature | Current Beta |
 | --- | --- |
-| Channel browsing | First 200 public videos immediately; scrolling near the bottom loads another 200, up to 1,000 |
+| Channel browsing | Up to 1,000 upload positions in batches of 200, with the next page saved across restarts |
+| Direct downloads | A public watch, Shorts, or `youtu.be` link opens Download settings |
 | Channel shortcuts | Suggested channels based on your local successful channel searches; pin to or remove from the saved channels bar |
 | Video | Best available, 1080p, 720p, or 360p, when available |
 | Audio | MP3 output |
 | Captions | English captions, if available for the video |
-| Downloads | Folder selection, progress, cancellation, retry, and history |
+| Downloads | Folder selection, progress, cancellation, retries, queue recovery, and completed-file locations |
 | Processing | yt-dlp, FFmpeg, FFprobe, and Deno embedded in the standalone EXE and extracted locally on first launch |
 
 Some uploads, formats, or captions may not be available. YouTube can change how videos are delivered, so not every download will succeed. Private, members-only, login-restricted, and DRM-protected content are not supported. This is a **Beta**, not a guarantee of uninterrupted downloads.
 
-To browse older uploads, keep scrolling down the **Library** list. The app loads more in batches instead of scanning the full channel upfront. Your selections remain checked while the next batch loads; if a request fails, use **Retry loading** at the end of the list.
+Scroll near the end of the unfiltered list or click **Load more videos** to browse older uploads. Selections stay checked while the next batch loads. If a page fails, click **Retry loading**. If a disk or permission issue prevents the queue from saving, resolve the issue and click **Retry saving and resume**.
 
 ## Responsible use and legal notice
 

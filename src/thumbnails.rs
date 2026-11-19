@@ -1,13 +1,15 @@
 //! Bounded, cached thumbnail fetches for *validated* public YouTube video IDs.
 //! The downloader engine remains yt-dlp; thumbnails are purely presentation.
-use crate::engine::{validate_id, Video};
-use std::collections::HashMap;
+use crate::engine::validate_id;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const MIN_IMAGE_BYTES: u64 = 201;
 const MAX_IMAGE_BYTES: u64 = 350_000;
+const RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn valid_image(path: &Path) -> bool {
     std::fs::metadata(path)
@@ -27,25 +29,26 @@ fn jpeg_header(path: &Path) -> bool {
 
 // A failed or partial download must not leave the cache permanently broken.
 // URLMon writes a temporary file; only a verified result is published.
-fn publish_image(tmp: &Path, path: &Path) -> bool {
+// Some(true) means that this call published the file, Some(false) is a cache hit.
+fn publish_image(tmp: &Path, path: &Path) -> Option<bool> {
     if !valid_image(tmp) || !jpeg_header(tmp) {
         let _ = std::fs::remove_file(tmp);
-        return false;
+        return None;
     }
     if valid_image(path) && jpeg_header(path) {
         // Another process may have populated the cache in the meantime.
         let _ = std::fs::remove_file(tmp);
-        return true;
+        return Some(false);
     }
     if path.exists() && std::fs::remove_file(path).is_err() {
         let _ = std::fs::remove_file(tmp);
-        return false;
+        return None;
     }
     if std::fs::rename(tmp, path).is_err() {
         let _ = std::fs::remove_file(tmp);
-        return false;
+        return None;
     }
-    true
+    Some(true)
 }
 
 struct FetchSlot {
@@ -97,7 +100,7 @@ pub fn cached(video_id: &str) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn download(video_id: &str, path: &Path) -> bool {
+fn download(video_id: &str, path: &Path) -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "urlmon")]
     extern "system" {
@@ -134,31 +137,23 @@ fn download(video_id: &str, path: &Path) -> bool {
     };
     if result != 0 {
         let _ = std::fs::remove_file(&tmp);
-        return false;
+        return None;
     }
     publish_image(&tmp, path)
 }
 
 #[cfg(not(windows))]
-fn download(_video_id: &str, _path: &Path) -> bool {
-    false
-}
-
-fn fetch_with_status(
-    video_id: &str,
-    downloader: impl FnOnce(&str, &Path) -> bool,
-) -> Option<(PathBuf, bool)> {
-    let path = cache_path(video_id)?;
-    fetch_at_path(video_id, path, downloader)
+fn download(_video_id: &str, _path: &Path) -> Option<bool> {
+    None
 }
 
 fn fetch_at_path(
     video_id: &str,
     path: PathBuf,
-    downloader: impl FnOnce(&str, &Path) -> bool,
-) -> Option<(PathBuf, bool)> {
+    downloader: impl FnOnce(&str, &Path) -> Option<bool>,
+) -> Option<bool> {
     if valid_image(&path) {
-        return Some((path, false));
+        return Some(false);
     }
     let (slot, owner) = {
         let mut active = active_fetches().lock().unwrap_or_else(|e| e.into_inner());
@@ -179,47 +174,109 @@ fn fetch_at_path(
         while !*completed {
             completed = slot.wake.wait(completed).unwrap_or_else(|e| e.into_inner());
         }
-        return valid_image(&path).then_some((path, false));
+        return valid_image(&path).then_some(false);
     }
     let _owner = FetchOwner { id: video_id, slot };
     // A different caller could have completed while we registered our slot.
     if valid_image(&path) {
-        return Some((path, false));
+        return Some(false);
     }
     std::fs::create_dir_all(path.parent()?).ok()?;
-    (downloader(video_id, &path) && valid_image(&path)).then_some((path, true))
+    let published = downloader(video_id, &path)?;
+    valid_image(&path).then_some(published)
 }
 
-/// Small groups provide progressive thumbnails without flooding the network.
-pub fn update_in_background(
-    videos: Vec<Video>,
-    update: impl Fn(Vec<String>) + Send + Sync + 'static,
-) {
-    std::thread::spawn(move || {
-        update_batches(
-            &videos,
-            |id| fetch_with_status(id, download).is_some_and(|(_, new)| new),
-            update,
-        );
-    });
+/// Loads thumbnails on one worker, prioritizing the latest requested range.
+pub struct VisibleThumbnailLoader {
+    requests: Arc<VisibleRequests>,
 }
 
-fn update_batches(
-    videos: &[Video],
-    mut fetch_new: impl FnMut(&str) -> bool,
-    mut update: impl FnMut(Vec<String>),
-) {
-    let mut changed = Vec::with_capacity(6);
-    for video in videos.iter().take(200) {
-        if fetch_new(&video.id) {
-            changed.push(video.id.clone());
-            if changed.len() == 6 {
-                update(std::mem::take(&mut changed));
-            }
-        }
+struct VisibleRequests {
+    // None means the loader was dropped and any pending requests were discarded.
+    pending: Mutex<Option<VecDeque<String>>>,
+    wake: Condvar,
+}
+
+enum ThumbnailStatus {
+    Ready,
+    RetryAfter(Instant),
+}
+
+impl VisibleRequests {
+    fn next(&self) -> Option<String> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .wake
+            .wait_while(pending, |pending| {
+                pending.as_ref().is_some_and(VecDeque::is_empty)
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        pending.as_mut()?.pop_front()
     }
-    if !changed.is_empty() {
-        update(changed);
+}
+
+impl VisibleThumbnailLoader {
+    pub fn new(update: impl Fn(Vec<String>) + Send + 'static) -> Self {
+        Self::with_fetch(|id| fetch_at_path(id, cache_path(id)?, download), update)
+    }
+
+    fn with_fetch(
+        mut fetch: impl FnMut(&str) -> Option<bool> + Send + 'static,
+        update: impl Fn(Vec<String>) + Send + 'static,
+    ) -> Self {
+        let requests = Arc::new(VisibleRequests {
+            pending: Mutex::new(Some(VecDeque::new())),
+            wake: Condvar::new(),
+        });
+        let worker_requests = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            let mut statuses = HashMap::new();
+            while let Some(id) = worker_requests.next() {
+                match statuses.get(&id) {
+                    Some(ThumbnailStatus::Ready) => continue,
+                    Some(ThumbnailStatus::RetryAfter(at)) if Instant::now() < *at => continue,
+                    _ => {}
+                }
+                match fetch(&id) {
+                    Some(published) => {
+                        statuses.insert(id.clone(), ThumbnailStatus::Ready);
+                        if published {
+                            update(vec![id]);
+                        }
+                    }
+                    None => {
+                        statuses.insert(
+                            id,
+                            ThumbnailStatus::RetryAfter(Instant::now() + RETRY_DELAY),
+                        );
+                    }
+                }
+            }
+        });
+        Self { requests }
+    }
+
+    /// Replaces pending work. Put visible IDs first, followed by overscan.
+    /// An in-flight fetch may finish and report its image after replacement.
+    pub fn request(&self, ids: Vec<String>) {
+        let pending = ids.into_iter().filter(|id| validate_id(id)).collect();
+        *self
+            .requests
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(pending);
+        self.requests.wake.notify_one();
+    }
+}
+
+impl Drop for VisibleThumbnailLoader {
+    fn drop(&mut self) {
+        *self
+            .requests
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.requests.wake.notify_one();
     }
 }
 
@@ -228,7 +285,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_dir() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -260,13 +317,17 @@ mod tests {
         let mut jpeg = vec![3; 1_024];
         jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
         std::fs::write(&tmp, &jpeg).unwrap();
-        assert!(publish_image(&tmp, &target));
+        assert_eq!(publish_image(&tmp, &target), Some(true));
         assert_eq!(std::fs::read(&target).unwrap(), jpeg);
+        assert!(!tmp.exists());
+
+        std::fs::write(&tmp, &jpeg).unwrap();
+        assert_eq!(publish_image(&tmp, &target), Some(false));
         assert!(!tmp.exists());
 
         // A failed download must not replace a healthy cached image.
         std::fs::write(&tmp, vec![9; 200]).unwrap();
-        assert!(!publish_image(&tmp, &target));
+        assert_eq!(publish_image(&tmp, &target), None);
         assert_eq!(std::fs::read(&target).unwrap(), jpeg);
         assert!(!tmp.exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -279,7 +340,7 @@ mod tests {
         let tmp = root.join("thumbnail.tmp");
         let html = format!("<html>{}</html>", "x".repeat(1_024));
         std::fs::write(&tmp, &html).unwrap();
-        assert!(!publish_image(&tmp, &target));
+        assert_eq!(publish_image(&tmp, &target), None);
         assert!(!tmp.exists());
         assert!(!target.exists());
 
@@ -288,7 +349,7 @@ mod tests {
         let mut jpeg = vec![7; 2_048];
         jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
         std::fs::write(&tmp, &jpeg).unwrap();
-        assert!(publish_image(&tmp, &target));
+        assert_eq!(publish_image(&tmp, &target), Some(true));
         assert_eq!(std::fs::read(&target).unwrap(), jpeg);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -321,7 +382,7 @@ mod tests {
                 fetch_at_path("racedupe001", path, |_, path| {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(30));
-                    std::fs::write(path, vec![7; 2_048]).is_ok()
+                    std::fs::write(path, vec![7; 2_048]).ok().map(|()| true)
                 })
             }));
         }
@@ -334,7 +395,7 @@ mod tests {
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| outcome.as_ref().unwrap().1)
+                .filter(|outcome| **outcome == Some(true))
                 .count(),
             1
         );
@@ -344,30 +405,76 @@ mod tests {
     }
 
     #[test]
-    fn background_updates_only_contain_new_ids_in_batches_of_six() {
-        let videos: Vec<_> = (0..15)
-            .map(|i| Video {
-                id: format!("{i:011}"),
-                title: String::new(),
-                duration: String::new(),
-                uploaded: String::new(),
-            })
-            .collect();
-        let mut batches = Vec::new();
-        update_batches(
-            &videos,
-            |id| id != "00000000002" && id != "00000000008",
-            |ids| batches.push(ids),
+    fn thumbnail_worker_prefers_latest_range_after_the_active_fetch() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(5);
+        let loader = VisibleThumbnailLoader::with_fetch(
+            move |id| {
+                started_tx.send(id.to_owned()).unwrap();
+                if id == "00000000001" {
+                    resume_rx.recv_timeout(timeout).unwrap();
+                }
+                Some(true)
+            },
+            move |ids| updated_tx.send(ids).unwrap(),
         );
+
+        loader.request(vec!["00000000001".into(), "00000000002".into()]);
+        assert_eq!(started_rx.recv_timeout(timeout).unwrap(), "00000000001");
+        loader.request(vec!["00000000003".into()]);
+        loader.request(vec!["00000000004".into(), "00000000005".into()]);
+        resume_tx.send(()).unwrap();
         assert_eq!(
-            batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![6, 6, 1]
+            updated_rx.recv_timeout(timeout).unwrap(),
+            vec!["00000000001"]
         );
-        let expected: Vec<_> = videos
-            .iter()
-            .filter(|video| video.id != "00000000002" && video.id != "00000000008")
-            .map(|video| video.id.clone())
-            .collect();
-        assert_eq!(batches.into_iter().flatten().collect::<Vec<_>>(), expected);
+        for id in ["00000000004", "00000000005"] {
+            assert_eq!(started_rx.recv_timeout(timeout).unwrap(), id);
+            assert_eq!(updated_rx.recv_timeout(timeout).unwrap(), vec![id]);
+        }
+    }
+
+    #[test]
+    fn thumbnail_worker_skips_cached_ids_and_throttles_failed_ids() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(5);
+        let loader = VisibleThumbnailLoader::with_fetch(
+            move |id| {
+                started_tx.send(id.to_owned()).unwrap();
+                match id {
+                    "00000000001" => Some(false),
+                    "00000000002" => None,
+                    _ => Some(true),
+                }
+            },
+            move |ids| updated_tx.send(ids).unwrap(),
+        );
+        loader.request(vec![
+            "00000000001".into(),
+            "00000000002".into(),
+            "00000000003".into(),
+        ]);
+        for id in ["00000000001", "00000000002", "00000000003"] {
+            assert_eq!(started_rx.recv_timeout(timeout).unwrap(), id);
+        }
+        assert_eq!(
+            updated_rx.recv_timeout(timeout).unwrap(),
+            vec!["00000000003"]
+        );
+
+        loader.request(vec![
+            "00000000001".into(),
+            "00000000002".into(),
+            "00000000003".into(),
+            "00000000004".into(),
+        ]);
+        assert_eq!(started_rx.recv_timeout(timeout).unwrap(), "00000000004");
+        assert_eq!(
+            updated_rx.recv_timeout(timeout).unwrap(),
+            vec!["00000000004"]
+        );
     }
 }

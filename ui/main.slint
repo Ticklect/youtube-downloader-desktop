@@ -12,6 +12,7 @@ export struct VideoRow {
 
 export struct TaskRow {
     job-index: int,
+    has-output: bool,
     title: string,
     title-long: bool,
     detail: string,
@@ -63,6 +64,7 @@ component KeyboardTarget {
 
 component ControlButton inherits Rectangle {
     in property <string> label: "";
+    in property <string> hint: "";
     in property <bool> left-aligned: false;
     in property <length> min-button-width: 58px;
     in property <bool> enabled: true;
@@ -82,26 +84,67 @@ component ControlButton inherits Rectangle {
 
     height: 39px;
     min-width: root.min-button-width;
-    border-radius: 6px;
-    border-width: 1px;
-    border-color: area.has-focus ? root.text-color : !root.enabled ? root.border : (root.primary || root.selected) ? root.accent : root.border;
-    background: !root.enabled ? #252527 : (root.primary || root.selected) ? root.accent : area.has-hover ? #323337 : root.surface;
+    border-radius: 8px;
+    border-width: area.has-focus ? 2px : 1px;
+    border-color: area.has-focus ? root.text-color : !root.enabled ? root.border : root.primary ? root.accent : root.border;
+    background: !root.enabled ? root.surface : root.primary ? (area.has-hover ? root.accent.brighter(0.10) : root.accent)
+        : root.selected ? root.surface.brighter(0.48) : area.has-hover ? #303037 : root.surface;
     Text {
         text: root.label;
         x: root.left-aligned ? 10px : 5px;
         width: parent.width - (root.left-aligned ? 20px : 10px);
+        y: root.hint == "" ? 0px : 5px;
+        height: root.hint == "" ? parent.height : 22px;
         overflow: elide;
-        color: !root.enabled ? #77797d : (root.primary || root.selected) ? root.accent-ink : root.text-color;
+        color: !root.enabled ? #83838c : root.primary ? root.accent-ink : root.text-color;
         font-size: 13px;
         font-weight: root.primary ? 700 : 600;
         horizontal-alignment: root.left-aligned ? left : center;
         vertical-alignment: center;
+    }
+    if root.selected && root.enabled && !root.primary: Rectangle {
+        x: parent.width - 12px; y: 6px; width: 5px; height: 5px;
+        border-radius: 3px;
+        background: root.accent;
+    }
+    if root.hint != "": Text {
+        y: 27px; width: parent.width; height: 20px;
+        text: root.hint; color: #bdbdc5; font-size: 11px;
+        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
     }
     area := KeyboardTarget {
         width: parent.width;
         height: parent.height;
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+component MediaThumbnail inherits Rectangle {
+    in property <image> artwork;
+    in property <string> duration: "";
+    in property <color> placeholder: #28282d;
+    background: root.placeholder;
+    border-radius: 7px;
+    clip: true;
+    Image { width: parent.width; height: parent.height; source: root.artwork; image-fit: cover; }
+    if root.artwork.width == 0: Text {
+        width: parent.width; height: parent.height;
+        text: "▶"; color: #bcbcc5; font-size: 19px;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    if root.duration != "" && root.duration != "Duration unknown": Rectangle {
+        x: parent.width - self.width - 5px;
+        y: parent.height - self.height - 5px;
+        width: max(30px, duration-label.preferred-width + 10px);
+        height: 21px;
+        background: #111115ed;
+        border-radius: 4px;
+        duration-label := Text {
+            width: parent.width; height: parent.height;
+            text: root.duration; color: #ffffff; font-size: 11px; font-weight: 700;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
     }
 }
 
@@ -118,16 +161,24 @@ export component MainWindow inherits Window {
 
     in-out property <string> theme: "red";
     private property <bool> mono: root.theme == "mono";
-    private property <color> accent: root.mono ? #eeeeee : #e60032;
+    private property <color> accent: root.mono ? #eeeeee : #df153f;
     private property <color> accent-ink: root.mono ? #111214 : #ffffff;
-    private property <color> canvas: root.mono ? #151515 : #101113;
-    private property <color> surface: root.mono ? #242424 : #1b1c1f;
-    private property <color> field: root.mono ? #303030 : #232427;
-    private property <color> edge: root.mono ? #4b4b4b : #35363a;
+    private property <color> canvas: root.mono ? #141414 : #111115;
+    private property <color> surface: root.mono ? #212121 : #1a1a20;
+    private property <color> field: root.mono ? #2c2c2c : #25252d;
+    private property <color> edge: root.mono ? #383838 : #32323b;
     private property <color> ink: #f5f5f6;
     private property <color> muted: root.mono ? #d0d0d0 : #b0b2b6;
     private property <color> faded: root.mono ? #a4a4a4 : #95989d;
-    private property <color> selected-bg: root.mono ? #2b2b2b : #211c20;
+    private property <color> selected-bg: root.mono ? #303030 : #2d1e28;
+    private property <color> row-hover: root.mono ? #292929 : #25252e;
+    private property <color> selected-hover: root.mono ? #383838 : #37232f;
+    private property <color> divider: root.mono ? #2b2b2b : #26262e;
+    private property <length> library-row-height: root.compact-view ? 72px : 94px;
+    private property <length> library-art-width: root.compact-view ? 104px : 136px;
+    private property <length> library-title-expansion: 64px;
+    private property <length> queue-row-height: root.compact-view ? 94px : 106px;
+    private property <length> direct-preview-width: min(368px, max(160px, (root.height - 515px) * 16 / 9));
     private property <bool> has-queue-history: root.pending-items + root.finished-items > 0;
 
     in-out property <string> channel-url: "";
@@ -139,6 +190,21 @@ export component MainWindow inherits Window {
     in-out property <string> channel-error: "";
     in-out property <string> download-error: "";
     in-out property <string> queue-error: "";
+    in-out property <bool> queue-save-failed: false;
+    in-out property <bool> direct-video-setup: false;
+    out property <int> library-first-row: max(0, Math.floor(-root.library-scroll-y / root.library-row-height));
+    out property <int> library-visible-rows: max(1, Math.ceil(root.library-scroll-height / root.library-row-height) + 1);
+    private property <length> library-scroll-y: 0px;
+    private property <length> library-scroll-height: 0px;
+    changed library-first-row => { root.request-thumbnails(); }
+    changed library-visible-rows => { root.request-thumbnails(); }
+    changed page => {
+        if root.page == "discover" {
+            root.library-scroll-y = 0px;
+            root.leave-direct-video();
+        }
+        root.request-thumbnails();
+    }
     in-out property <string> channel-name: "No channel loaded";
     in-out property <string> selected-count: "0 videos selected";
     in-out property <int> selected-items: 0;
@@ -147,13 +213,14 @@ export component MainWindow inherits Window {
     in-out property <string> video-search: "";
     private property <string> expanded-video-id: "";
     private property <int> expanded-task-index: -1;
-    private property <bool> compact-review-visible: false;
     in-out property <string> queue-filter: "all";
     in-out property <int> pending-items: 0;
     in-out property <int> failed-items: 0;
     in-out property <int> finished-items: 0;
     in-out property <bool> loading: false;
     in-out property <bool> more-available: false;
+    private property <bool> show-pagination: !root.loading
+        && (root.more-available || root.loading-more || root.more-error != "");
     in-out property <bool> loading-more: false;
     in-out property <string> more-error: "";
     in-out property <bool> fullscreen-active: false;
@@ -163,6 +230,7 @@ export component MainWindow inherits Window {
         root.compact-view = root.width < 1100px;
     }
     changed video-search => {
+        root.library-scroll-y = 0px;
         // The search must refresh when assistive technology changes the
         // bound value, not only for physical keyboard edit notifications.
         root.search-videos();
@@ -180,6 +248,9 @@ export component MainWindow inherits Window {
     callback toggle-maximize();
     callback load-channel();
     callback load-more();
+    callback request-thumbnails();
+    callback leave-direct-video();
+    callback retry-queue-save();
     callback toggle-video(string);
     callback search-videos();
     callback select-all();
@@ -209,35 +280,47 @@ export component MainWindow inherits Window {
                 height: parent.height;
             }
             HorizontalLayout {
-                    padding-left: 17px;
-                    padding-right: 9px;
-                    spacing: 16px;
+                    padding-left: 23px;
+                    padding-right: 12px;
+                    spacing: 5px;
                     Rectangle {
-                        width: 31px;
+                        width: 192px;
                         height: 50px;
                         background: transparent;
                         Image {
                             source: @image-url("../assets/app-icon.png");
-                            x: (parent.width - self.width) / 2;
+                            x: 0px;
                             y: (parent.height - self.height) / 2;
-                            width: 24px;
-                            height: 24px;
+                            width: 25px;
+                            height: 25px;
                             image-fit: contain;
                         }
+                        Text {
+                            x: 36px; width: parent.width - 36px; height: parent.height;
+                            text: "YouTube Downloader"; color: root.ink;
+                            font-size: 14px; font-weight: 700; vertical-alignment: center;
+                        }
                     }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
                     for tab in [
                         { name: "Library", page: "discover" },
                         { name: "Download options", page: "setup" },
                         { name: "Downloads", page: "queue" }
                     ]: Rectangle {
-                        width: tab.page == "setup" ? 151px : 104px;
+                        width: tab.page == "setup" ? 138px : 101px;
                         height: 50px;
                         background: transparent;
-                        Text { text: tab.name; color: root.page == tab.page ? root.ink : root.muted; font-size: 13px; font-weight: root.page == tab.page ? 700 : 500; vertical-alignment: center; }
                         Rectangle {
-                            y: parent.height - 3px;
-                            height: 3px;
-                            background: root.page == tab.page ? root.accent : tab-hit.has-focus ? root.muted : transparent;
+                            y: 8px; height: 34px; width: parent.width;
+                            border-radius: 9px;
+                            border-width: tab-hit.has-focus ? 1px : 0px;
+                            border-color: root.muted;
+                            background: root.page == tab.page ? root.field : tab-hit.has-hover ? root.row-hover : transparent;
+                            Text {
+                                text: tab.name; color: root.page == tab.page ? root.ink : root.muted;
+                                font-size: 13px; font-weight: root.page == tab.page ? 700 : 500;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
                         }
                         accessible-role: button;
                         accessible-label: tab.name;
@@ -293,11 +376,19 @@ export component MainWindow inherits Window {
                         spacing: 10px;
                         VerticalLayout {
                             spacing: 6px;
-                            Text { text: "Channel videos"; color: root.ink; font-size: root.width > 1550px ? 31px : 27px; font-weight: 700; }
-                            if !root.compact-view || root.videos.length == 0: Text { text: "Browse and select videos to download"; color: root.muted; font-size: 13px; }
+                            Text { text: "Video library"; color: root.ink; font-size: root.compact-view ? 28px : 34px; font-weight: 700; }
+                            if !root.compact-view: Text { text: "Open a channel or download a single video"; color: root.muted; font-size: 13px; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Text { text: root.videos.length == 0 ? "" : root.compact-view && root.videos.length > 3 ? root.videos.length + " VIDEOS · SCROLL ↓" : root.videos.length + " VIDEOS"; color: root.faded; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+                        if root.videos.length > 0: Rectangle {
+                            width: 102px; height: 30px; border-radius: 15px;
+                            background: root.surface; border-width: 1px; border-color: root.edge;
+                            Text {
+                                text: root.videos.length + (root.videos.length == 1 ? " video" : " videos");
+                                color: root.muted; font-size: 12px; font-weight: 600;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
                     }
                     HorizontalLayout {
                         spacing: 12px;
@@ -309,17 +400,18 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 15px; padding-right: 10px;
                                 spacing: 9px;
-                            Text { text: "CHANNEL"; color: root.faded; font-size: 12px; font-weight: 700; width: 81px; vertical-alignment: center; }
+                                Text { text: "YouTube link"; color: root.muted; font-size: 12px; font-weight: 600; width: 82px; vertical-alignment: center; }
                                 LineEdit {
                                     text <=> root.channel-url;
-                                    placeholder-text: "https://youtube.com/@creator";
+                                    placeholder-text: "Paste a YouTube channel or video link";
+                                    accepted => { if !root.loading { root.load-channel(); } }
                                     horizontal-stretch: 1;
                                 }
                             }
                         }
                         ControlButton {
-                            width: 152px; height: 47px;
-                            label: root.loading ? "Loading..." : "Load channel →";
+                            width: 176px; height: 47px;
+                            label: root.loading ? "Loading..." : "Load channel or video";
                             enabled: !root.loading;
                             primary: true;
                             accent: root.accent; accent-ink: root.accent-ink; surface: root.surface; border: root.edge; text-color: root.ink;
@@ -329,7 +421,7 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         spacing: 12px;
                         Rectangle {
-                        height: 56px;
+                        height: root.compact-view ? 44px : 56px;
                         horizontal-stretch: 1;
                         background: root.mono ? #1e1e1e : #18191c;
                         border-radius: 9px;
@@ -572,24 +664,15 @@ export component MainWindow inherits Window {
                         background: root.surface;
                         border-width: 1px; border-color: root.edge;
                         border-radius: 8px;
-                        height: min(root.videos.length > 0 ? 37px + root.videos.length * 64px + (root.expanded-video-id == "" ? 0px : 63px) : 240px, max(120px, root.height - (root.compact-view ? 423px : 406px) - (root.channel-error == "" ? 0px : 58px)));
+                        height: min((root.videos.length > 0 ? 16px + root.videos.length * root.library-row-height + (root.expanded-video-id == "" ? 0px : root.library-title-expansion) : 240px) + (root.show-pagination ? 44px : 0px), max(root.show-pagination ? 165px : 120px, root.height - (root.compact-view ? 414px : 464px) - (root.channel-error == "" ? 0px : 58px)));
                         VerticalLayout {
                             spacing: 0px;
-                            Rectangle {
-                                height: 36px;
-                                background: root.mono ? #303030 : #222327;
-                                HorizontalLayout {
-                                    padding-left: 20px; padding-right: 22px;
-                                    spacing: 12px;
-                                    Text { text: "SAVE"; color: root.faded; font-size: 12px; font-weight: 700; width: 57px; vertical-alignment: center; }
-                                    Text { text: "VIDEO"; color: root.faded; font-size: 12px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
-                                    Text { text: "LENGTH"; color: root.faded; font-size: 12px; font-weight: 700; width: 110px; horizontal-alignment: right; vertical-alignment: center; }
-                                }
-                            }
-                            Rectangle { height: 1px; background: root.edge; }
                             if root.videos.length > 0: ScrollView {
                                 vertical-stretch: 1;
+                                content-y <=> root.library-scroll-y;
+                                changed visible-height => { root.library-scroll-height = self.visible-height; }
                                 scrolled => {
+                                    root.library-scroll-height = self.visible-height;
                                     if (root.more-available && !root.loading-more && !root.loading
                                             && root.video-search == "" && root.page == "discover"
                                             && -self.content-y + self.visible-height >= self.content-height - 224px) {
@@ -597,9 +680,9 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 VerticalLayout {
-                                    spacing: 0px;
-                                    for video[i] in root.videos: Rectangle {
-                                        height: video.title-long && root.expanded-video-id == video.id ? 127px : 64px;
+                                    padding: 8px; spacing: 0px;
+                                    for video in root.videos: Rectangle {
+                                        height: root.library-row-height + (video.title-long && root.expanded-video-id == video.id ? root.library-title-expansion : 0px);
                                         forward-focus: video-hit;
                                         accessible-role: checkbox;
                                         accessible-label: video.title;
@@ -607,24 +690,31 @@ export component MainWindow inherits Window {
                                         accessible-checkable: true;
                                         accessible-checked: video.selected;
                                         accessible-action-default => { if (!root.loading) { root.toggle-video(video.id); } }
-                                        border-width: video-hit.has-focus ? 1px : 0px;
-                                        border-color: video-hit.has-focus ? root.accent : transparent;
-                                        background: video-hit.has-hover ? root.mono ? #373737 : #30262a : video.selected ? root.selected-bg : Math.mod(i, 2) == 0 ? root.canvas : root.surface;
+                                        background: transparent;
+                                        Rectangle {
+                                            x: 0px; y: 2px; width: parent.width; height: parent.height - 4px;
+                                            border-radius: 9px;
+                                            border-width: video-hit.has-focus ? 1px : 0px;
+                                            border-color: root.accent;
+                                            background: video.selected
+                                                ? (video-hit.has-hover ? root.selected-hover : root.selected-bg)
+                                                : (video-hit.has-hover ? root.row-hover : transparent);
+                                        }
                                         video-hit := KeyboardTarget {
-                                            width: parent.width; height: 64px;
+                                            width: parent.width; height: root.library-row-height;
                                             enabled: !root.loading;
                                             retain-focus-after-key: true;
                                             clicked => { root.toggle-video(video.id); }
                                         }
                                         HorizontalLayout {
-                                            x: 0px; y: 0px; height: 64px;
-                                            padding-left: 20px; padding-right: 22px;
-                                            spacing: 12px;
+                                            x: 0px; y: 0px; height: root.library-row-height;
+                                            padding-left: 20px; padding-right: video.title-long ? 108px : 22px;
+                                            spacing: 14px;
                                             Rectangle {
-                                                width: 57px;
+                                                width: 32px;
                                                 background: transparent;
                                                 Rectangle {
-                                                    width: 18px; height: 18px;
+                                                    width: 20px; height: 20px;
                                                     y: (parent.height - self.height) / 2;
                                                     border-radius: 4px; border-width: 1px;
                                                     border-color: video.selected ? root.accent : root.muted;
@@ -633,70 +723,43 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Rectangle {
-                                                width: 100px; background: transparent;
-                                                Rectangle {
-                                                    width: parent.width; height: 56px;
+                                                width: root.library-art-width; background: transparent;
+                                                MediaThumbnail {
+                                                    width: parent.width; height: self.width * 9 / 16;
                                                     y: (parent.height - self.height) / 2;
-                                                    border-radius: 5px; clip: true;
-                                                    background: #292a2e;
-                                                    Image { source: video.thumbnail; image-fit: cover; }
-                                                    if video.thumbnail.width == 0: Text {
-                                                        text: "▶"; font-size: 19px; color: root.faded;
-                                                        horizontal-alignment: center; vertical-alignment: center;
-                                                    }
+                                                    artwork: video.thumbnail;
+                                                    duration: video.detail;
+                                                    placeholder: root.field;
                                                 }
                                             }
                                             Rectangle {
                                                 horizontal-stretch: 1; background: transparent;
                                                 VerticalLayout {
-                                                    height: 42px; y: (parent.height - self.height) / 2;
-                                                    spacing: 4px;
+                                                    height: 47px; y: (parent.height - self.height) / 2;
+                                                    spacing: 5px;
                                                     Text {
-                                                        height: 20px; text: video.title; color: root.ink; font-size: 15px;
+                                                        height: 24px; text: video.title; color: root.ink; font-size: root.compact-view ? 16px : 17px;
                                                         font-weight: video.selected ? 700 : 600; overflow: elide;
                                                         Tooltip { text: @markdown("\{video.title}"); }
                                                     }
                                                     Text { height: 18px; text: video.secondary; color: root.muted; font-size: 13px; overflow: elide; }
                                                 }
                                             }
-                                            Text {
-                                                text: video.detail; color: root.muted; font-size: 12px;
-                                                width: 110px; horizontal-alignment: right;
-                                                vertical-alignment: video.title-long ? top : center;
-                                                overflow: elide;
-                                            }
                                         }
                                         if video.title-long: ControlButton {
-                                            x: parent.width - 99px; y: 32px; width: 74px; height: 28px;
+                                            x: parent.width - 95px; y: (root.library-row-height - self.height) / 2; width: 75px; height: 30px;
                                             label: root.expanded-video-id == video.id ? "Hide title" : "Full title";
                                             accent: root.accent; accent-ink: root.accent-ink;
                                             surface: root.field; border: root.edge; text-color: root.ink;
                                             clicked => { root.expanded-video-id = root.expanded-video-id == video.id ? "" : video.id; }
                                         }
                                         if video.title-long && root.expanded-video-id == video.id: Rectangle {
-                                            x: 20px; y: 65px; width: parent.width - 42px; height: 60px;
+                                            x: 20px; y: root.library-row-height; width: parent.width - 42px; height: 58px;
                                             background: root.field; border-radius: 5px;
                                             Text {
                                                 x: 12px; y: 5px; width: parent.width - 24px; height: 50px;
                                                 text: video.title; wrap: word-wrap; color: root.ink; font-size: 13px;
                                                 vertical-alignment: center;
-                                            }
-                                        }
-                                        Rectangle { y: parent.height - 1px; height: 1px; background: root.edge; }
-                                    }
-                                    if root.loading-more: Rectangle {
-                                        height: 46px; background: root.surface;
-                                        Text { text: "Loading 200 more videos…"; color: root.muted; font-size: 13px; vertical-alignment: center; horizontal-alignment: center; }
-                                    }
-                                    if root.more-error != "": Rectangle {
-                                        height: 52px; background: root.surface;
-                                        HorizontalLayout {
-                                            padding-left: 12px; padding-right: 12px; spacing: 12px;
-                                            Text { text: root.more-error; color: root.muted; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                            ControlButton {
-                                                width: 94px; height: 34px; label: "Retry loading";
-                                                accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                                clicked => { root.load-more(); }
                                             }
                                         }
                                     }
@@ -705,14 +768,35 @@ export component MainWindow inherits Window {
                             if root.videos.length == 0: Rectangle {
                                 vertical-stretch: 1; background: transparent;
                                 Text {
-                                    text: root.loading ? "Looking for uploads..." : root.channel-name == "No channel loaded" ? "Your library is empty" : root.video-search != "" ? "No matching videos" : "No videos found";
+                                    text: root.loading ? "Looking for uploads..." : root.channel-name == "No channel loaded" ? "Your library is empty" : root.video-search != "" ? (root.show-pagination ? "No matches in loaded videos" : "No matching videos") : "No videos found";
                                     color: root.ink; font-size: 17px; font-weight: 600;
-                                    y: parent.height / 2 - 30px; height: 27px; horizontal-alignment: center;
+                                    y: parent.height / 2 - 27px; height: 27px; horizontal-alignment: center;
                                 }
                                 Text {
-                                    text: root.loading ? "Scanning public channel videos" : root.channel-name == "No channel loaded" ? "Paste a YouTube channel above to get started." : root.video-search != "" ? "Try another title or clear the filter." : "Try reloading the channel.";
+                                    text: root.loading ? "Scanning public channel videos" : root.channel-name == "No channel loaded" ? "Paste a YouTube channel above to get started." : root.video-search != "" ? (root.show-pagination ? "Load more uploads to keep searching." : "Try another title or clear the filter.") : root.show-pagination ? "Load more uploads to keep browsing." : "Try reloading the channel.";
                                     color: root.muted; font-size: 12px;
                                     y: parent.height / 2 + 8px; height: 25px; horizontal-alignment: center;
+                                }
+                            }
+                            if root.show-pagination: Rectangle {
+                                height: 44px;
+                                background: root.surface;
+                                Rectangle { height: 1px; background: root.edge; }
+                                HorizontalLayout {
+                                    padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                    Text {
+                                        text: root.loading-more ? "Loading more videos…" : root.more-error != "" ? root.more-error : root.video-search != "" ? "The title filter applies to loaded videos." : "More uploads available";
+                                        color: root.muted; font-size: 12px; vertical-alignment: center;
+                                        horizontal-stretch: 1; overflow: elide;
+                                    }
+                                    ControlButton {
+                                        width: 140px; height: 32px;
+                                        label: root.more-error != "" ? "Retry loading" : "Load more videos";
+                                        enabled: !root.loading-more;
+                                        accent: root.accent; accent-ink: root.accent-ink;
+                                        surface: root.field; border: root.edge; text-color: root.ink;
+                                        clicked => { root.load-more(); }
+                                    }
                                 }
                             }
                         }
@@ -758,22 +842,19 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         if !root.compact-view: Text { text: root.selected-count; color: root.faded; font-size: 12px; font-weight: 700; vertical-alignment: center; }
                     }
-                    if !root.compact-view && root.selected-items > 0: ScrollView {
-                        height: min(440px, max(305px, root.height - 390px));
-                        HorizontalLayout {
-                        width: parent.width;
-                        height: min(435px, max(305px, root.height - 395px));
-                        spacing: 18px;
+                    if root.selected-items > 0: HorizontalLayout {
+                        vertical-stretch: 1;
+                        spacing: 16px;
                         Rectangle {
-                            width: (parent.width - 18px) * 0.40;
+                            width: (parent.width - 16px) * 0.37;
                             background: root.surface;
                             border-radius: 10px; border-width: 1px; border-color: root.edge;
                             VerticalLayout {
                                 padding: 20px; spacing: 12px;
                                 VerticalLayout {
                                     spacing: 7px;
-                                    Text { text: "Your selection"; color: root.ink; font-size: 19px; font-weight: 700; }
-                                    Text { text: root.selected-count; color: root.muted; font-size: 12px; }
+                                    Text { text: root.direct-video-setup ? "Video preview" : "Your selection"; color: root.ink; font-size: 19px; font-weight: 700; }
+                                    if !root.direct-video-setup: Text { text: root.selected-count; color: root.muted; font-size: 12px; }
                                 }
                                 Rectangle { height: 1px; background: root.edge; }
                                 if root.selected-items > 0: ScrollView {
@@ -781,18 +862,33 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         spacing: 0px;
                                         for video in root.selected-videos: Rectangle {
-                                            height: 68px;
+                                            height: root.direct-video-setup ? min(parent.width - 4px, root.direct-preview-width) * 9 / 16 + 55px : 76px;
                                             background: transparent;
-                                            HorizontalLayout {
+                                            if root.direct-video-setup: VerticalLayout {
+                                                padding-right: 4px; spacing: 10px;
+                                                Rectangle {
+                                                    height: min(self.width, root.direct-preview-width) * 9 / 16;
+                                                    background: transparent;
+                                                    MediaThumbnail {
+                                                        width: min(parent.width, root.direct-preview-width);
+                                                        height: parent.height;
+                                                        artwork: video.thumbnail; duration: video.detail; placeholder: root.field;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: video.title; color: root.ink; font-size: 17px;
+                                                    font-weight: 700; height: 40px; wrap: word-wrap; overflow: elide;
+                                                    Tooltip { text: @markdown("\{video.title}"); }
+                                                }
+                                            }
+                                            if !root.direct-video-setup: HorizontalLayout {
                                                 spacing: 12px;
                                                 Rectangle {
-                                                    width: 85px; background: transparent;
-                                                    Rectangle {
-                                                        width: parent.width; height: 48px;
+                                                    width: 104px; background: transparent;
+                                                    MediaThumbnail {
+                                                        width: parent.width; height: self.width * 9 / 16;
                                                         y: (parent.height - self.height) / 2;
-                                                        background: #303135;
-                                                        border-radius: 4px; clip: true;
-                                                        Image { source: video.thumbnail; image-fit: cover; }
+                                                        artwork: video.thumbnail; placeholder: root.field;
                                                     }
                                                 }
                                                 Rectangle {
@@ -812,83 +908,83 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                 }
-                                if root.selected-items == 0: Rectangle {
-                                    vertical-stretch: 1;
-                                Text { text: "Choose videos in Library to continue."; color: root.muted; font-size: 14px; vertical-alignment: center; horizontal-alignment: center; }
-                                }
                                 ControlButton {
-                                    width: 170px; label: root.selected-items > 0 ? "← Edit selection" : "← Choose videos";
+                                    width: 170px; label: root.direct-video-setup ? "← Back to Library" : "← Edit selection";
                                     accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
                                     clicked => { root.page = "discover"; }
                                 }
                             }
                         }
                         Rectangle {
-                            width: (parent.width - 18px) * 0.60;
+                            width: (parent.width - 16px) * 0.63;
                             background: root.surface;
                             border-radius: 10px; border-width: 1px; border-color: root.edge;
                             VerticalLayout {
-                                padding: 22px; spacing: 17px;
+                                padding: 20px; spacing: 12px;
                                 Text { text: "Output preferences"; color: root.ink; font-size: 19px; font-weight: 700; }
-                                Rectangle { height: 1px; background: root.edge; }
                                 VerticalLayout {
-                                    spacing: 12px;
-                                    Text { text: "SAVE LOCATION"; color: root.muted; font-size: 12px; font-weight: 700; letter-spacing: 0.6px; }
+                                    height: 76px; spacing: 6px;
+                                    Text { text: "Format"; height: 18px; color: root.muted; font-size: 12px; font-weight: 600; }
                                     HorizontalLayout {
-                                        spacing: 10px;
-                                        Text { text: root.download-folder; color: root.ink; font-size: 12px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                                        height: 52px; spacing: 8px;
+                                        for format in [
+                                            { id: "video", name: "Video", hint: "MP4 preferred" },
+                                            { id: "audio", name: "Audio MP3", hint: "Audio only" },
+                                            { id: "captions", name: "Captions", hint: "English subtitles" }
+                                        ]: ControlButton {
+                                            width: 119px; height: 52px;
+                                            label: format.name; hint: format.hint; selected: root.mode == format.id;
+                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
+                                            clicked => { root.mode = format.id; }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    }
+                                }
+                                if root.mode == "video": VerticalLayout {
+                                    height: 59px; spacing: 6px;
+                                    Text { text: "Video quality"; height: 18px; color: root.muted; font-size: 12px; font-weight: 600; }
+                                    HorizontalLayout {
+                                        height: 35px; spacing: 8px;
+                                        for option in [
+                                            { label: "Best", id: "best" }, { label: "1080p", id: "1080" },
+                                            { label: "720p", id: "720" }, { label: "360p", id: "360" }
+                                        ]: ControlButton {
+                                            width: 80px; height: 35px;
+                                            label: option.label; selected: root.quality == option.id;
+                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
+                                            clicked => { root.quality = option.id; }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    }
+                                }
+                                Rectangle { height: 1px; background: root.divider; }
+                                VerticalLayout {
+                                    height: 60px; spacing: 6px;
+                                    Text { text: "Save location"; height: 18px; color: root.muted; font-size: 12px; font-weight: 600; }
+                                    HorizontalLayout {
+                                        height: 36px; spacing: 8px;
+                                        Rectangle {
+                                            height: 36px; horizontal-stretch: 1;
+                                            background: root.canvas; border-radius: 8px;
+                                            Text {
+                                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                                text: root.download-folder; color: root.ink; font-size: 12px;
+                                                overflow: elide; vertical-alignment: center;
+                                                Tooltip { text: @markdown("\{root.download-folder}"); }
+                                            }
+                                        }
                                         ControlButton {
-                                            width: 101px; label: "Change";
+                                            width: 90px; height: 36px; label: "Change";
                                             accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
                                             clicked => { root.choose-folder(); }
                                         }
                                     }
                                 }
-                                Rectangle { height: 1px; background: root.edge; }
-                                VerticalLayout {
-                                    spacing: 12px;
-                                    Text { text: "OUTPUT FORMAT"; color: root.muted; font-size: 12px; font-weight: 700; letter-spacing: 0.6px; }
-                                    HorizontalLayout {
-                                        spacing: 9px;
-                                        ControlButton {
-                                            width: 95px; label: "Video"; selected: root.mode == "video";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.mode = "video"; }
-                                        }
-                                        ControlButton {
-                                            width: 105px; label: "Audio MP3"; selected: root.mode == "audio";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.mode = "audio"; }
-                                        }
-                                        ControlButton {
-                                            width: 100px; label: "Captions"; selected: root.mode == "captions";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.mode = "captions"; }
-                                        }
-                                    }
-                                }
-                                Rectangle { height: 1px; background: root.edge; }
-                                VerticalLayout {
-                                    spacing: 12px;
-                                    Text { text: "VIDEO QUALITY"; color: root.muted; font-size: 12px; font-weight: 700; letter-spacing: 0.6px; }
-                                    HorizontalLayout {
-                                        spacing: 9px;
-                                        for option in [
-                                            { label: "Best", id: "best" }, { label: "1080p", id: "1080" }, { label: "720p", id: "720" }, { label: "360p", id: "360" }
-                                        ]: ControlButton {
-                                            width: 81px; label: option.label; selected: root.quality == option.id; enabled: root.mode == "video";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.quality = option.id; }
-                                        }
-                                    }
-                                    Text { text: root.mode == "video" ? "MP4 preferred; another container may be used if necessary." : "Quality only applies to video downloads."; color: root.muted; font-size: 12px; }
-                                }
                                 Rectangle { vertical-stretch: 1; background: transparent; }
                             }
                         }
                     }
-                    }
-                    if !root.compact-view && root.selected-items == 0: Rectangle {
+                    if root.selected-items == 0: Rectangle {
                         height: 190px;
                         border-width: 1px; border-color: root.edge;
                         border-radius: 9px; background: root.surface;
@@ -901,145 +997,6 @@ export component MainWindow inherits Window {
                                 width: 174px; height: 40px; label: "Browse library"; primary: true;
                                 accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
                                 clicked => { root.page = "discover"; }
-                            }
-                        }
-                    }
-                    if root.compact-view: ScrollView {
-                        vertical-stretch: 1;
-                        VerticalLayout {
-                            spacing: 13px;
-                            Rectangle {
-                                height: 50px; background: root.surface;
-                                border-radius: 7px; border-width: 1px; border-color: root.edge;
-                                HorizontalLayout {
-                                    padding-left: 17px; padding-right: 15px; spacing: 10px;
-                                    Text {
-                                        text: root.compact-review-visible ? root.selected-count + " · SCROLL FOR OPTIONS ↓" : root.selected-count;
-                                        color: root.ink; font-size: 13px; font-weight: 600;
-                                        vertical-alignment: center; horizontal-stretch: 1;
-                                    }
-                                    Rectangle { width: 118px; background: transparent;
-                                        ControlButton {
-                                            width: parent.width; height: 32px; y: (parent.height - self.height) / 2;
-                                            label: root.compact-review-visible ? "Hide review" : "Review videos";
-                                            enabled: root.selected-items > 0;
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.compact-review-visible = !root.compact-review-visible; }
-                                        }
-                                    }
-                                    Rectangle { width: 120px; background: transparent;
-                                        ControlButton {
-                                            width: parent.width; height: 32px; y: (parent.height - self.height) / 2;
-                                            label: "Edit selection";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.page = "discover"; }
-                                        }
-                                    }
-                                }
-                            }
-                            if root.compact-review-visible && root.selected-items > 0: Rectangle {
-                                height: min(210px, 55px + root.selected-videos.length * 50px);
-                                background: root.field; border-radius: 7px;
-                                border-width: 1px; border-color: root.edge;
-                                VerticalLayout {
-                                    padding: 12px; spacing: 8px;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Text {
-                                            text: "SELECTED VIDEOS";
-                                            color: root.ink; font-size: 12px; font-weight: 700;
-                                            vertical-alignment: center; horizontal-stretch: 1;
-                                        }
-                                        ControlButton {
-                                            width: 76px; height: 29px; label: "Close";
-                                            accent: root.accent; accent-ink: root.accent-ink;
-                                            surface: root.surface; border: root.edge; text-color: root.ink;
-                                            clicked => { root.compact-review-visible = false; }
-                                        }
-                                    }
-                                    ScrollView {
-                                        vertical-stretch: 1;
-                                        VerticalLayout {
-                                            spacing: 0px;
-                                            for video[i] in root.selected-videos: Rectangle {
-                                                height: 50px; background: transparent;
-                                                HorizontalLayout {
-                                                    spacing: 10px;
-                                                    Rectangle {
-                                                        width: 74px; height: 42px; background: root.surface;
-                                                        border-radius: 4px; clip: true;
-                                                        Image { source: video.thumbnail; image-fit: cover; }
-                                                    }
-                                                    Text {
-                                                        text: (i + 1) + ".  " + video.title;
-                                                        color: root.ink; font-size: 13px;
-                                                        vertical-alignment: center; wrap: word-wrap;
-                                                    }
-                                                }
-                                                Rectangle { y: parent.height - 1px; height: 1px; background: root.edge; }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Rectangle {
-                                height: 62px; background: root.surface;
-                                border-radius: 7px; border-width: 1px; border-color: root.edge;
-                                HorizontalLayout {
-                                    padding-left: 17px; padding-right: 17px; spacing: 12px;
-                                    Text { text: "Save location"; width: 102px; color: root.muted; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-                                    Text { text: root.download-folder; color: root.ink; font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
-                                    Rectangle { width: 93px; background: transparent;
-                                        ControlButton {
-                                            width: parent.width; height: 34px; y: (parent.height - self.height) / 2;
-                                            label: "Change";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.choose-folder(); }
-                                        }
-                                    }
-                                }
-                            }
-                            Rectangle {
-                                height: 62px; background: root.surface;
-                                border-radius: 7px; border-width: 1px; border-color: root.edge;
-                                HorizontalLayout {
-                                    padding-left: 17px; spacing: 8px;
-                                    Text { text: "Format"; width: 102px; color: root.muted; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-                                    for option in [
-                                        { id: "video", label: "Video" },
-                                        { id: "audio", label: "Audio MP3" },
-                                        { id: "captions", label: "Captions" }
-                                    ]: Rectangle {
-                                        width: 100px; background: transparent;
-                                        ControlButton {
-                                            width: parent.width; height: 35px; y: (parent.height - self.height) / 2;
-                                            label: option.label; selected: root.mode == option.id;
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.mode = option.id; }
-                                        }
-                                    }
-                                }
-                            }
-                            Rectangle {
-                                height: 62px; background: root.surface;
-                                border-radius: 7px; border-width: 1px; border-color: root.edge;
-                                HorizontalLayout {
-                                    padding-left: 17px; spacing: 8px;
-                                    Text { text: "Video quality"; width: 102px; color: root.muted; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-                                    for option in [
-                                        { id: "best", label: "Best" }, { id: "1080", label: "1080p" },
-                                        { id: "720", label: "720p" }, { id: "360", label: "360p" }
-                                    ]: Rectangle {
-                                        width: 74px; background: transparent;
-                                        ControlButton {
-                                            width: parent.width; height: 35px; y: (parent.height - self.height) / 2;
-                                            label: option.label; selected: root.quality == option.id;
-                                            enabled: root.mode == "video";
-                                            accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
-                                            clicked => { root.quality = option.id; }
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -1064,9 +1021,9 @@ export component MainWindow inherits Window {
                                     Text {
                                         height: 18px;
                                         text: root.download-error != "" ? root.download-error :
-                                            root.compact-view && root.compact-review-visible
-                                            ? "Close review or scroll to check format and quality"
-                                            : root.selected-count + "  ·  " + (root.mode == "video" ? "Video " + root.quality : root.mode == "audio" ? "Audio MP3" : "Captions") + "  ·  Up to 3 concurrent jobs";
+                                            root.selected-count + "  ·  " + (root.mode == "video"
+                                                ? (root.quality == "best" ? "Video, best quality" : "Video, up to " + root.quality + "p")
+                                                : root.mode == "audio" ? "Audio MP3" : "Captions");
                                         color: root.download-error == "" ? root.muted : root.ink; font-size: 12px; overflow: elide;
                                     }
                                 }
@@ -1082,7 +1039,7 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if !root.compact-view: Rectangle { vertical-stretch: 1; background: transparent; }
+                    if root.selected-items == 0: Rectangle { vertical-stretch: 1; background: transparent; }
                 }
                 if root.page == "queue": VerticalLayout {
                     spacing: 20px;
@@ -1093,8 +1050,7 @@ export component MainWindow inherits Window {
                             spacing: 7px;
                             Text { text: "Downloads"; color: root.ink; font-size: root.width > 1550px ? 32px : 28px; font-weight: 700; }
                             Text {
-                                text: root.queue-error != "" ? "Action needed: " + root.queue-error
-                                    : root.compact-view && root.tasks.length > 2 ? root.queue-count + "  ·  SCROLL ↓" : root.queue-count;
+                                text: root.queue-error != "" ? "Action needed: " + root.queue-error : root.queue-count;
                                 color: root.queue-error == "" ? root.muted : root.mono ? #e3d5cb : #ffb0b9;
                                 font-size: 13px; overflow: elide;
                             }
@@ -1155,7 +1111,7 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if root.has-queue-history: HorizontalLayout {
+                    if root.has-queue-history || root.queue-save-failed: HorizontalLayout {
                         spacing: 8px;
                         for option in [
                             { id: "all", label: "All files" }, { id: "active", label: "In progress" },
@@ -1172,18 +1128,24 @@ export component MainWindow inherits Window {
                             }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        if root.queue-save-failed: ControlButton {
+                            width: 202px; height: 32px; label: "Retry saving and resume";
+                            accent: root.accent; accent-ink: root.accent-ink; surface: root.surface; border: root.edge; text-color: root.ink;
+                            clicked => { root.retry-queue-save(); }
+                        }
                     }
                     Rectangle {
-                        background: root.canvas;
-                        height: min(root.tasks.length > 0 ? 45px + root.tasks.length * 106px + (root.expanded-task-index >= 0 ? 58px : 0px) : 240px, max(215px, root.height - 370px));
+                        background: root.surface;
+                        border-radius: 11px; border-width: 1px; border-color: root.edge; clip: true;
+                        vertical-stretch: 1; min-height: 160px;
                         VerticalLayout {
                             spacing: 0px;
                             if root.has-queue-history: Rectangle {
-                                height: 44px; background: root.mono ? #303030 : #222327;
+                                height: 44px; background: root.surface;
                                 HorizontalLayout {
                                     padding-left: 24px; padding-right: 26px;
-                                    Text { text: "DOWNLOAD / FILE"; color: root.faded; font-size: 12px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
-                                    Text { text: "STATUS"; color: root.faded; font-size: 12px; font-weight: 700; width: 105px; horizontal-alignment: right; vertical-alignment: center; }
+                                    Text { text: "File"; color: root.muted; font-size: 12px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text { text: "Status"; color: root.muted; font-size: 12px; font-weight: 600; width: 105px; horizontal-alignment: right; vertical-alignment: center; }
                                 }
                             }
                             if root.has-queue-history: Rectangle { height: 1px; background: root.edge; }
@@ -1192,26 +1154,21 @@ export component MainWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 0px;
                                     for task in root.tasks: Rectangle {
-                                        height: task.title-long && root.expanded-task-index == task.job-index ? 164px : 106px;
+                                        height: root.queue-row-height + (task.title-long && root.expanded-task-index == task.job-index ? 58px : 0px);
                                         background: root.surface;
                                         HorizontalLayout {
-                                            x: 0px; y: 0px; height: 106px;
+                                            x: 0px; y: 0px; height: root.queue-row-height;
                                             padding-left: 20px; padding-right: 20px; spacing: 16px;
                                             Rectangle {
-                                                width: 112px; background: transparent;
-                                                Rectangle {
-                                                    width: parent.width; height: 63px;
+                                                width: root.compact-view ? 112px : 128px; background: transparent;
+                                                MediaThumbnail {
+                                                    width: parent.width; height: self.width * 9 / 16;
                                                     y: (parent.height - self.height) / 2;
-                                                    background: #2a2a2d; border-radius: 5px; clip: true;
-                                                    Image { source: task.thumbnail; image-fit: cover; }
-                                                    if task.thumbnail.width == 0: Text {
-                                                        text: "▶"; color: root.faded; font-size: 18px;
-                                                        vertical-alignment: center; horizontal-alignment: center;
-                                                    }
+                                                    artwork: task.thumbnail; placeholder: root.field;
                                                 }
                                             }
                                             VerticalLayout {
-                                                padding-top: 13px; padding-bottom: 11px; spacing: 7px;
+                                                padding-top: 10px; padding-bottom: 9px; spacing: 6px;
                                                 Text {
                                                     text: task.title; color: root.ink; font-size: root.width > 1550px ? 16px : 15px;
                                                     font-weight: 600; overflow: elide; horizontal-stretch: 1;
@@ -1220,8 +1177,10 @@ export component MainWindow inherits Window {
                                                 Text { text: task.metadata; color: root.muted; font-size: 13px; }
                                                 Text { text: task.detail; color: root.muted; font-size: 13px; overflow: elide; }
                                                 if task.state == "Downloading" || task.state == "Queued": Rectangle {
-                                                    height: 5px; border-radius: 2px; background: root.edge;
+                                                    height: 7px; border-radius: 4px; background: root.divider;
                                                     Rectangle {
+                                                        x: 0px;
+                                                        y: 0px;
                                                         width: parent.width * task.progress / 100;
                                                         height: parent.height;
                                                         background: root.accent;
@@ -1231,10 +1190,10 @@ export component MainWindow inherits Window {
                                             }
                                             VerticalLayout {
                                                 width: task.title-long ? 202px : 173px;
-                                                padding-top: 15px; padding-bottom: 13px; spacing: 7px;
+                                                padding-top: 11px; padding-bottom: 10px; spacing: 6px;
                                                 Text {
                                                     text: task.state == "Downloading" ? task.progress + "% downloading" : task.state;
-                                                    color: task.state == "Completed" ? #60cc8a : task.state == "Failed" ? #f38e97 : root.muted;
+                                                    color: root.mono ? root.ink : task.state == "Completed" ? #92cbab : task.state == "Failed" ? #f4b873 : root.ink;
                                                     font-size: 13px; font-weight: 700; horizontal-alignment: right;
                                                 }
                                                 HorizontalLayout {
@@ -1260,7 +1219,7 @@ export component MainWindow inherits Window {
                                                         clicked => { root.cancel-job(task.job-index); }
                                                     }
                                                     if task.state == "Completed": ControlButton {
-                                                        width: 105px; height: 33px; label: "Open folder";
+                                                        width: 112px; height: 33px; label: task.has-output ? "Show in folder" : "Open folder";
                                                         accent: root.accent; accent-ink: root.accent-ink; surface: root.field; border: root.edge; text-color: root.ink;
                                                         clicked => { root.open-job-folder(task.job-index); }
                                                     }
@@ -1268,7 +1227,7 @@ export component MainWindow inherits Window {
                                             }
                                         }
                                         if task.title-long && root.expanded-task-index == task.job-index: Rectangle {
-                                            x: 20px; y: 106px; width: parent.width - 40px; height: 56px;
+                                            x: 20px; y: root.queue-row-height; width: parent.width - 40px; height: 56px;
                                             background: root.field; border-radius: 5px;
                                             Text {
                                                 x: 12px; y: 5px; width: parent.width - 24px; height: 45px;
@@ -1296,16 +1255,6 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    if root.has-queue-history: HorizontalLayout {
-                        spacing: 12px;
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        ControlButton {
-                            width: 184px; height: 44px; label: "Browse more videos";
-                            accent: root.accent; accent-ink: root.accent-ink; surface: root.surface; border: root.edge; text-color: root.ink;
-                            clicked => { root.page = "discover"; }
-                        }
-                    }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
                 }
                 if root.page == "legal": VerticalLayout {
                     spacing: 25px;
