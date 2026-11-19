@@ -40,6 +40,7 @@ struct Job {
     percent: i32,
     detail: String,
     cancel: Arc<AtomicBool>,
+    output_files: Vec<PathBuf>,
 }
 
 // A request for the same video in a different destination is a distinct job.
@@ -53,7 +54,7 @@ fn is_pending_duplicate(
 ) -> bool {
     job.video.id == video.id
         && job.mode == mode
-        && job.quality == quality
+        && (mode != Mode::Video || job.quality == quality)
         && job.folder == *folder
         && matches!(job.status, JobState::Queued | JobState::Active)
 }
@@ -84,7 +85,7 @@ fn unqueued_videos(
         .iter()
         .filter(|job| {
             job.mode == mode
-                && job.quality == quality
+                && (mode != Mode::Video || job.quality == quality)
                 && job.folder == *folder
                 && matches!(job.status, JobState::Queued | JobState::Active)
         })
@@ -108,6 +109,8 @@ struct State {
     active: usize,
     channel_name: String,
     channel_url: String,
+    channel_next_start: Option<usize>,
+    direct_video: Option<Video>,
     channel_history: Vec<store::SavedChannelHistory>,
     saved_channels: Vec<store::SavedChannel>,
     folder: PathBuf,
@@ -120,6 +123,7 @@ impl State {
             theme: self.theme.clone(),
             channel_name: self.channel_name.clone(),
             channel_url: self.channel_url.clone(),
+            channel_next_start: self.channel_next_start,
             channel_history: self.channel_history.clone(),
             saved_channels: self.saved_channels.clone(),
             folder: self.folder.clone(),
@@ -145,6 +149,7 @@ impl State {
                         mode: job.mode,
                         quality: job.quality.clone(),
                         folder: job.folder.clone(),
+                        output_files: job.output_files.clone(),
                         state: match job.status {
                             JobState::Queued => store::SavedJobStatus::Queued,
                             JobState::Active if cancelling => store::SavedJobStatus::Cancelled,
@@ -237,6 +242,7 @@ fn restore_state() -> (State, Option<String>) {
                         },
                         detail: job.detail,
                         cancel: Arc::new(AtomicBool::new(false)),
+                        output_files: job.output_files,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -256,6 +262,8 @@ fn restore_state() -> (State, Option<String>) {
                     active: 0,
                     channel_name: saved.channel_name,
                     channel_url: saved.channel_url,
+                    channel_next_start: saved.channel_next_start,
+                    direct_video: None,
                     channel_history: saved.channel_history,
                     saved_channels: saved.saved_channels,
                     folder: saved.folder,
@@ -351,26 +359,42 @@ struct ChannelPages {
 }
 
 impl ChannelPages {
-    fn reset(&mut self, loaded: usize) {
-        // Duplicated IDs can leave a page with fewer than 200 saved rows.
-        // Continue from the next playlist page, never repeat earlier items.
-        self.next_start = if loaded == 0 {
-            1
-        } else {
-            ((loaded - 1) / engine::CHANNEL_PAGE_SIZE + 1) * engine::CHANNEL_PAGE_SIZE + 1
-        };
-        self.available =
-            loaded >= engine::CHANNEL_PAGE_SIZE && self.next_start <= engine::MAX_CHANNEL_VIDEOS;
+    fn restore(&mut self, stored: Option<usize>, loaded: usize) {
+        self.next_start = stored.unwrap_or_else(|| {
+            if loaded < engine::CHANNEL_PAGE_SIZE {
+                return 0;
+            }
+            loaded.div_ceil(engine::CHANNEL_PAGE_SIZE) * engine::CHANNEL_PAGE_SIZE + 1
+        });
+        if self.next_start > engine::MAX_CHANNEL_VIDEOS {
+            self.next_start = 0;
+        }
+        self.available = self.next_start != 0;
         self.fetching = false;
     }
 
-    fn after_page(&mut self, page_len: usize, total: usize) {
-        self.next_start += engine::CHANNEL_PAGE_SIZE;
-        self.fetching = false;
-        self.available = page_len == engine::CHANNEL_PAGE_SIZE
-            && total < engine::MAX_CHANNEL_VIDEOS
-            && self.next_start <= engine::MAX_CHANNEL_VIDEOS;
+    fn after_page(&mut self, start: usize, has_more: bool) {
+        let next = start + engine::CHANNEL_PAGE_SIZE;
+        self.restore(
+            Some(if has_more && next <= engine::MAX_CHANNEL_VIDEOS {
+                next
+            } else {
+                0
+            }),
+            0,
+        );
     }
+}
+
+fn retain_cached_channel_videos(current: &mut Vec<(Video, bool)>, cached: Vec<(Video, bool)>) {
+    let mut seen: std::collections::HashSet<String> =
+        current.iter().map(|(video, _)| video.id.clone()).collect();
+    current.extend(
+        cached
+            .into_iter()
+            .filter(|(video, _)| seen.insert(video.id.clone()))
+            .take(engine::MAX_CHANNEL_VIDEOS.saturating_sub(current.len())),
+    );
 }
 
 fn set_visible_selection(items: &mut [(Video, bool)], search: &str, checked: bool) {
@@ -414,11 +438,15 @@ fn publish_video_selection_counts(ui: &MainWindow, state: &State) {
     let filter = ui.get_video_search().to_string().trim().to_lowercase();
     let visible_selected = visible_selected_count(&state.videos, &filter);
     ui.set_visible_selected_items(visible_selected as i32);
-    let selected = state
-        .videos
-        .iter()
-        .filter(|(_, selected)| *selected)
-        .count();
+    let selected = if state.direct_video.is_some() {
+        1
+    } else {
+        state
+            .videos
+            .iter()
+            .filter(|(_, selected)| *selected)
+            .count()
+    };
     ui.set_selected_items(selected as i32);
     ui.set_selected_count(
         format!(
@@ -535,24 +563,31 @@ fn publish_selected_videos(ui: &MainWindow, state: &State) {
     // search filters the visible list. Otherwise saved selections look lost.
     let mut previous_images = existing_video_thumbnails(&ui.get_selected_videos());
     previous_images.extend(existing_video_thumbnails(&ui.get_videos()));
+    let selection = state
+        .videos
+        .iter()
+        .filter_map(|(video, selected)| (*selected).then_some(video));
+    let videos: Box<dyn Iterator<Item = &Video>> = match &state.direct_video {
+        Some(video) => Box::new(std::iter::once(video)),
+        None => Box::new(selection),
+    };
     ui.set_selected_videos(ModelRc::from(Rc::new(VecModel::from(
-        state
-            .videos
-            .iter()
-            .filter(|(_, selected)| *selected)
-            .map(|(video, selected)| VideoRow {
+        videos
+            .map(|video| VideoRow {
                 id: video.id.clone().into(),
                 title: video.title.clone().into(),
                 title_long: video.title.chars().count() > 55,
                 detail: video.duration.clone().into(),
-                secondary: if video.uploaded.is_empty() {
+                secondary: if !video.uploaded.is_empty() {
+                    format!("Published {}", video.uploaded)
+                } else if state.direct_video.is_none() {
                     state.channel_name.clone()
                 } else {
-                    format!("Published {}", video.uploaded)
+                    String::new()
                 }
                 .into(),
                 thumbnail: thumbnail_for_video(&video.id, &previous_images),
-                selected: *selected,
+                selected: true,
             })
             .collect::<Vec<_>>(),
     ))));
@@ -584,18 +619,6 @@ fn publish_video_selection_change(ui: &MainWindow, state: &State, id: &str, sele
     set_video_row_selection(&ui.get_videos(), id, selected);
     publish_video_selection_counts(ui, state);
     publish_selected_videos(ui, state);
-}
-
-fn update_thumbnails(ui: &MainWindow, state: &Arc<Mutex<State>>) {
-    let videos = {
-        let value = state.lock().unwrap();
-        value
-            .videos
-            .iter()
-            .map(|(v, _)| v.clone())
-            .collect::<Vec<_>>()
-    };
-    update_page_thumbnails(ui, videos);
 }
 
 /// A batch of fetched thumbnails changes only the corresponding image cells.
@@ -635,21 +658,20 @@ fn refresh_video_thumbnails(ui: &MainWindow, changed_ids: Vec<String>) {
     apply_thumbnail_images(&[videos, selected], &images);
 }
 
-fn update_page_thumbnails(ui: &MainWindow, videos: Vec<Video>) {
-    let weak_ui = ui.as_weak();
-    thumbnails::update_in_background(videos, move |changed_ids| {
-        let ui = weak_ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                refresh_video_thumbnails(&ui, changed_ids);
-            }
-        });
-    });
+fn visible_thumbnail_ids(model: &ModelRc<VideoRow>, first: usize, count: usize) -> Vec<String> {
+    let end = first.saturating_add(count).min(model.row_count());
+    (first..end)
+        .chain(end..end.saturating_add(4).min(model.row_count()))
+        .chain(first.saturating_sub(2)..first.min(model.row_count()))
+        .filter_map(|index| model.row_data(index))
+        .map(|row| row.id.to_string())
+        .collect()
 }
 
 fn task_row_for_job(index: usize, job: &Job) -> TaskRow {
     TaskRow {
         job_index: index as i32,
+        has_output: !job.output_files.is_empty(),
         title: job.video.title.clone().into(),
         title_long: job.video.title.chars().count() > 40,
         thumbnail: thumbnails::cached(&job.video.id)
@@ -764,6 +786,7 @@ fn set_task_row_lifecycle(model: &ModelRc<TaskRow>, index: usize, job: &Job) -> 
             std::cmp::Ordering::Greater => start = middle + 1,
             std::cmp::Ordering::Less => end = middle,
             std::cmp::Ordering::Equal => {
+                row.has_output = !job.output_files.is_empty();
                 row.progress = job.percent;
                 row.detail = format!("{}  ·  {}", job.detail, job.video.duration).into();
                 row.state = match job.status {
@@ -1018,6 +1041,10 @@ fn schedule_after_completion(
         let mut state = state.lock().unwrap();
         match reserve_and_commit_jobs(&mut state, &store::session_path(), engine::MAX_PARALLEL) {
             Ok(to_start) => {
+                if ui.get_queue_save_failed() {
+                    ui.set_queue_save_failed(false);
+                    ui.set_queue_error("".into());
+                }
                 if let Some(finished) = finished_index {
                     let newly_active = to_start.iter().map(|item| item.0).collect::<Vec<_>>();
                     publish_scheduled_changes(ui, &state, finished, &newly_active);
@@ -1027,6 +1054,7 @@ fn schedule_after_completion(
                 to_start
             }
             Err(error) => {
+                ui.set_queue_save_failed(true);
                 publish_tasks(ui, &state);
                 show_queue_error(
                     ui,
@@ -1104,7 +1132,7 @@ fn schedule_after_completion(
                     let mut value = state.lock().unwrap();
                     if let Some(job) = value.jobs.get_mut(index) {
                         job.status = match &result {
-                            Ok(()) => JobState::Completed,
+                            Ok(_) => JobState::Completed,
                             Err(_) if cancel.load(Ordering::Relaxed) => JobState::Cancelled,
                             Err(_) => JobState::Failed,
                         };
@@ -1114,7 +1142,14 @@ fn schedule_after_completion(
                             job.percent
                         };
                         job.detail = match result {
-                            Ok(()) => "Saved successfully".to_owned(),
+                            Ok(files) => {
+                                job.output_files = files
+                                    .into_iter()
+                                    .filter(|path| store::valid_output_path(path))
+                                    .take(store::MAX_OUTPUT_FILES)
+                                    .collect();
+                                "Saved successfully".to_owned()
+                            }
                             Err(message) => message,
                         };
                     }
@@ -1124,6 +1159,38 @@ fn schedule_after_completion(
             });
         });
     }
+}
+
+fn existing_download_output(folder: &Path, outputs: &[PathBuf]) -> Option<PathBuf> {
+    let root = folder.canonicalize().ok()?;
+    outputs
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .find(|path| path.starts_with(&root) && path.is_file())
+}
+
+#[cfg(windows)]
+fn select_in_explorer(explorer: &mut std::process::Command, file: &Path) {
+    use std::os::windows::process::CommandExt;
+    let path = file.to_string_lossy();
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+    };
+    explorer.raw_arg(format!(r#"/select,"{path}""#));
+}
+
+#[cfg(not(windows))]
+fn select_in_explorer(explorer: &mut std::process::Command, file: &Path) {
+    explorer.arg(file);
+}
+
+fn show_direct_video(ui: &MainWindow, state: &mut State, video: Video) {
+    state.direct_video = Some(video);
+    ui.set_direct_video_setup(true);
+    publish_video_selection_counts(ui, state);
+    publish_selected_videos(ui, state);
 }
 
 fn default_folder() -> PathBuf {
@@ -1141,6 +1208,20 @@ fn show_channel_error(ui: &MainWindow, text: impl Into<String>) {
     let message = text.into();
     ui.set_channel_error(message.clone().into());
     show_error(ui, message);
+}
+
+fn show_channel_load_error(ui: &MainWindow, current: &State, error: String) {
+    if current.videos.is_empty() {
+        show_channel_error(ui, error);
+    } else {
+        show_channel_error(
+            ui,
+            format!(
+                "{error} Still showing videos from {}.",
+                current.channel_name
+            ),
+        );
+    }
 }
 
 fn show_download_error(ui: &MainWindow, text: impl Into<String>) {
@@ -1183,9 +1264,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pages = Arc::new(Mutex::new(ChannelPages::default()));
     {
         let mut paging = pages.lock().unwrap();
-        paging.reset(state.lock().unwrap().videos.len());
+        let state = state.lock().unwrap();
+        paging.restore(state.channel_next_start, state.videos.len());
         ui.set_more_available(paging.available);
     }
+    ui.on_request_thumbnails({
+        let weak = ui.as_weak();
+        let worker = thumbnails::VisibleThumbnailLoader::new({
+            let weak = weak.clone();
+            move |ids| {
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        refresh_video_thumbnails(&ui, ids);
+                    }
+                });
+            }
+        });
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let ids = match ui.get_page().as_str() {
+                "discover" => visible_thumbnail_ids(
+                    &ui.get_videos(),
+                    ui.get_library_first_row().max(0) as usize,
+                    ui.get_library_visible_rows().max(1) as usize,
+                ),
+                "setup" if ui.get_direct_video_setup() => {
+                    visible_thumbnail_ids(&ui.get_selected_videos(), 0, 1)
+                }
+                _ => Vec::new(),
+            };
+            worker.request(ids);
+        }
+    });
+    ui.on_leave_direct_video({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut state = state.lock().unwrap();
+            if state.direct_video.take().is_some() {
+                ui.set_direct_video_setup(false);
+                publish_videos(&ui, &state);
+            }
+        }
+    });
     ui.set_download_folder(folder.display().to_string().into());
     ui.set_theme(state.lock().unwrap().theme.clone().into());
     // Visual smoke tests override only the displayed palette, without
@@ -1361,29 +1484,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let generation = begin_channel_request(&channel_request_generation);
             {
                 let mut paging = pages.lock().unwrap();
-                paging.reset(state.lock().unwrap().videos.len());
-                ui.set_more_available(false);
+                // The new request supersedes any in-flight page, but the
+                // committed library keeps its cursor until a load succeeds.
+                paging.fetching = false;
                 ui.set_loading_more(false);
-                ui.set_more_error("".into());
             }
             let input = ui.get_channel_url().to_string();
-            let canonical = match engine::channel_url(&input) {
-                Ok(url) => url,
+            let link = engine::video_url(&input).and_then(|video| match video {
+                Some(url) => Ok((url, true)),
+                None => engine::channel_url(&input).map(|url| (url, false)),
+            });
+            let (canonical, is_video) = match link {
+                Ok(link) => link,
                 Err(error) => {
                     ui.set_loading(false);
                     ui.set_more_available(pages.lock().unwrap().available);
-                    let previous = state.lock().unwrap();
-                    if !previous.videos.is_empty() {
-                        ui.set_channel_name(
-                            format!("Previously loaded: {}", previous.channel_name).into(),
-                        );
-                        show_channel_error(
-                            &ui,
-                            format!("{error} Previous channel videos are still shown below."),
-                        );
-                    } else {
-                        show_channel_error(&ui, error);
-                    }
+                    show_channel_load_error(&ui, &state.lock().unwrap(), error);
                     return;
                 }
             };
@@ -1392,27 +1508,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => {
                     ui.set_loading(false);
                     ui.set_more_available(pages.lock().unwrap().available);
-                    show_channel_error(&ui, error);
+                    show_channel_load_error(&ui, &state.lock().unwrap(), error);
                     return;
                 }
             };
             ui.set_channel_error("".into());
-            let same_channel = {
-                let mut value = state.lock().unwrap();
-                let same = value.channel_url == canonical;
-                if !same {
-                    value.channel_url = canonical.clone();
-                    value.channel_name = String::new();
-                    value.videos.clear();
-                    value.persist();
-                }
-                same
-            };
-            if !same_channel {
-                ui.set_channel_name("Loading channel...".into());
-                ui.set_video_search("".into());
-                publish(&ui, &state.lock().unwrap());
+            if is_video {
+                ui.set_loading(true);
+                show_error(&ui, "Looking up video…");
+                let weak = weak.clone();
+                let state = Arc::downgrade(&state);
+                let pages = pages.clone();
+                let channel_request_generation = channel_request_generation.clone();
+                std::thread::spawn(move || {
+                    let result = engine::load_video(&exe, &canonical);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if channel_request_generation.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
+                        let (Some(ui), Some(state)) = (weak.upgrade(), state.upgrade()) else {
+                            return;
+                        };
+                        ui.set_loading(false);
+                        ui.set_more_available(pages.lock().unwrap().available);
+                        match result {
+                            Ok(video) => {
+                                show_direct_video(&ui, &mut state.lock().unwrap(), video);
+                                ui.set_download_error("".into());
+                                ui.set_page("setup".into());
+                                ui.invoke_request_thumbnails();
+                                show_error(&ui, "Video ready. Choose your download options.");
+                            }
+                            Err(error) => {
+                                show_channel_load_error(&ui, &state.lock().unwrap(), error)
+                            }
+                        }
+                    });
+                });
+                return;
             }
+            let same_channel = state.lock().unwrap().channel_url == canonical;
             ui.set_loading(true);
             show_error(&ui, "Scanning channel with yt-dlp…");
             let state = Arc::downgrade(&state);
@@ -1420,7 +1555,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pages = pages.clone();
             let channel_request_generation = channel_request_generation.clone();
             std::thread::spawn(move || {
-                let result = engine::load_channel(&exe, &input);
+                let result = engine::load_channel(&exe, &canonical);
                 let _ = slint::invoke_from_event_loop(move || {
                     if channel_request_generation.load(Ordering::SeqCst) != generation {
                         return;
@@ -1430,7 +1565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     ui.set_loading(false);
                     match result {
-                        Ok((name, videos)) => {
+                        Ok((name, videos, has_more)) => {
                             let page_len = videos.len();
                             show_error(
                                 &ui,
@@ -1444,45 +1579,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let clean_name =
                                     apply_loaded_channel_identity(&mut value, &canonical, &name);
                                 ui.set_channel_name(clean_name.into());
-                                let previous = value.videos.clone();
+                                let previous = std::mem::take(&mut value.videos);
                                 value.videos = reconcile_videos(&previous, videos, same_channel);
-                                // Reloading the same channel must not erase
-                                // older pages or their selected videos.
-                                if same_channel {
-                                    let mut seen: std::collections::HashSet<String> = value
-                                        .videos
-                                        .iter()
-                                        .map(|(video, _)| video.id.clone())
-                                        .collect();
-                                    for (video, selected) in
-                                        previous.into_iter().skip(engine::CHANNEL_PAGE_SIZE)
-                                    {
-                                        if value.videos.len() >= engine::MAX_CHANNEL_VIDEOS {
-                                            break;
-                                        }
-                                        if seen.insert(video.id.clone()) {
-                                            value.videos.push((video, selected));
-                                        }
-                                    }
+                                // Displayed rows may be fewer than the raw
+                                // page size, so a row index is not a page boundary.
+                                if same_channel
+                                    && (has_more || previous.len() > engine::CHANNEL_PAGE_SIZE)
+                                {
+                                    retain_cached_channel_videos(&mut value.videos, previous);
                                 }
+                                let mut paging = pages.lock().unwrap();
+                                if same_channel
+                                    && has_more
+                                    && (paging.next_start > engine::CHANNEL_PAGE_SIZE + 1
+                                        || value.videos.len() > page_len)
+                                {
+                                    let next_start = paging.next_start;
+                                    paging.restore(Some(next_start), 0);
+                                } else {
+                                    paging.after_page(1, has_more);
+                                }
+                                value.channel_next_start = Some(paging.next_start);
                                 value.persist();
                                 publish_channels(&ui, &value);
-                                let mut paging = pages.lock().unwrap();
-                                paging.reset(value.videos.len());
-                                if page_len < engine::CHANNEL_PAGE_SIZE {
-                                    paging.available = false;
-                                }
                                 ui.set_more_available(paging.available);
                             }
+                            ui.set_more_error("".into());
+                            if !same_channel {
+                                ui.set_video_search("".into());
+                            }
                             publish(&ui, &state.lock().unwrap());
-                            update_thumbnails(&ui, &state);
+                            ui.invoke_request_thumbnails();
                         }
                         Err(error) => {
                             ui.set_more_available(pages.lock().unwrap().available);
-                            if !same_channel {
-                                ui.set_channel_name("Channel could not be loaded".into());
-                            }
-                            show_channel_error(&ui, error);
+                            show_channel_load_error(&ui, &state.lock().unwrap(), error);
                         }
                     }
                 });
@@ -1497,7 +1628,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let channel_request_generation = channel_request_generation.clone();
         move || {
             let Some(ui) = weak.upgrade() else { return };
-            if ui.get_loading() || !ui.get_video_search().is_empty() {
+            if ui.get_loading() {
                 return;
             }
             let start = {
@@ -1543,24 +1674,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     ui.set_loading_more(false);
                     match result {
-                        Ok((_name, incoming)) => {
-                            let count = incoming.len();
+                        Ok((_name, incoming, has_more)) => {
                             let appended = {
                                 let mut current = state.lock().unwrap();
                                 if current.channel_url != url {
                                     return;
                                 }
-                                let added =
-                                    append_channel_page(&mut current.videos, incoming.clone());
-                                current.persist();
+                                let added = append_channel_page(&mut current.videos, incoming);
                                 let mut paging = pages.lock().unwrap();
-                                paging.after_page(count, current.videos.len());
+                                paging.after_page(start, has_more);
+                                current.channel_next_start = Some(paging.next_start);
+                                current.persist();
                                 ui.set_more_available(paging.available);
                                 added
                             };
                             if appended > 0 {
                                 publish_videos(&ui, &state.lock().unwrap());
-                                update_page_thumbnails(&ui, incoming);
+                                ui.invoke_request_thumbnails();
                             }
                             show_error(
                                 &ui,
@@ -1611,6 +1741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // that second list on every keystroke can decode hundreds
                 // more thumbnails and invalidate its accessibility model.
                 publish_filtered_videos(&ui, &state.lock().unwrap());
+                ui.invoke_request_thumbnails();
             }
         }
     });
@@ -1705,14 +1836,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let quality = ui.get_quality().to_string();
-            let selected = state
-                .lock()
-                .unwrap()
-                .videos
-                .iter()
-                .filter(|(_, selected)| *selected)
-                .map(|(v, _)| v.clone())
-                .collect::<Vec<_>>();
+            let selected = {
+                let state = state.lock().unwrap();
+                match &state.direct_video {
+                    Some(video) => vec![video.clone()],
+                    None => state
+                        .videos
+                        .iter()
+                        .filter(|(_, selected)| *selected)
+                        .map(|(video, _)| video.clone())
+                        .collect(),
+                }
+            };
             if selected.is_empty() {
                 show_download_error(&ui, "Select at least one real video before downloading.");
                 return;
@@ -1740,6 +1875,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 percent: 0,
                                 detail: "Waiting for download slot…".into(),
                                 cancel: Arc::new(AtomicBool::new(false)),
+                                output_files: Vec::new(),
                             });
                         }
                     }
@@ -1795,6 +1931,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &ui,
                     format!("Cancellation requested, but could not save it for restart: {error}"),
                 ),
+            }
+        }
+    });
+    ui.on_retry_queue_save({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !ui.get_queue_save_failed() {
+                return;
+            }
+            let tools = (|| {
+                Ok::<_, String>((
+                    engine::find_dependency("yt-dlp.exe")?,
+                    engine::find_dependency("ffmpeg.exe")?,
+                    engine::find_dependency("deno.exe")?,
+                ))
+            })();
+            match tools {
+                Ok((yt_dlp, ffmpeg, _)) => {
+                    schedule(&ui, &state, yt_dlp, ffmpeg);
+                    if !ui.get_queue_save_failed() {
+                        show_error(&ui, "Download queue saved.");
+                    }
+                }
+                Err(error) => show_queue_error(&ui, error),
             }
         }
     });
@@ -1923,26 +2085,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok()
                     .and_then(|i| value.jobs.get(i))
                     .filter(|job| job.status == JobState::Completed)
-                    .map(|job| job.folder.clone())
+                    .map(|job| (job.folder.clone(), job.output_files.clone()))
             };
-            let Some(folder) = folder else { return };
+            let Some((folder, outputs)) = folder else {
+                return;
+            };
             if !folder.is_dir() {
                 show_queue_error(&ui, "The download folder is no longer available.");
                 return;
             }
-            if let Err(error) = std::process::Command::new("explorer.exe")
-                .arg(folder)
-                .spawn()
-            {
-                show_queue_error(&ui, format!("Could not open folder: {error}"));
+            let mut explorer = std::process::Command::new("explorer.exe");
+            if outputs.is_empty() {
+                explorer.arg(&folder);
             } else {
+                let Some(file) = existing_download_output(&folder, &outputs) else {
+                    show_queue_error(&ui, "The downloaded file was moved or deleted.");
+                    return;
+                };
+                select_in_explorer(&mut explorer, &file);
+            }
+            if let Err(error) = explorer.spawn() {
+                show_queue_error(&ui, format!("Could not open folder: {error}"));
+            } else if !ui.get_queue_save_failed() {
                 ui.set_queue_error("".into());
             }
         }
     });
 
     publish(&ui, &state.lock().unwrap());
-    update_thumbnails(&ui, &state);
+    ui.invoke_request_thumbnails();
     // A deterministic active-transfer UI fixture has no network or filesystem
     // effects. It exists only for screenshot review in isolated smoke sessions.
     if std::env::var("YTD_UI_SMOKE_PREVIEW").as_deref() == Ok("1")
@@ -2087,6 +2258,7 @@ mod ui_state_tests {
     fn task_row(job_index: i32) -> TaskRow {
         TaskRow {
             job_index,
+            has_output: false,
             title: format!("Video {job_index}").into(),
             title_long: false,
             thumbnail: slint::Image::default(),
@@ -2113,6 +2285,7 @@ mod ui_state_tests {
                     percent: 0,
                     detail: "Waiting".into(),
                     cancel: Arc::new(AtomicBool::new(false)),
+                    output_files: Vec::new(),
                 })
                 .collect(),
             active: size.min(3),
@@ -2161,6 +2334,12 @@ mod ui_state_tests {
             assert!(std::fs::read_dir(&root)
                 .unwrap()
                 .all(|entry| entry.unwrap().path() == session));
+            std::fs::remove_dir(&session).unwrap();
+            let resumed = reserve_and_commit_jobs(&mut state, &session, slots).unwrap();
+            assert_eq!(resumed.len(), slots - existing_active);
+            assert_eq!(state.active, slots);
+            std::fs::remove_file(&session).unwrap();
+            std::fs::create_dir(&session).unwrap();
         }
         std::fs::remove_dir(&session).unwrap();
         std::fs::remove_dir(&root).unwrap();
@@ -2664,6 +2843,7 @@ mod ui_state_tests {
                         percent: 0,
                         detail: "Waiting".into(),
                         cancel: Arc::new(AtomicBool::new(false)),
+                        output_files: Vec::new(),
                     })
                     .collect(),
                 ..State::default()
@@ -2915,6 +3095,7 @@ mod ui_state_tests {
                 percent: 0,
                 detail: "Queued".into(),
                 cancel: Arc::new(AtomicBool::new(false)),
+                output_files: Vec::new(),
             }],
             saved_channels: vec![store::SavedChannel {
                 name: "Old pinned name".into(),
@@ -3063,6 +3244,7 @@ mod ui_state_tests {
             percent: 47,
             detail: "Downloading".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         let mut b = Job {
             video: video("defghijklmn", "Two"),
@@ -3073,6 +3255,7 @@ mod ui_state_tests {
             percent: 40,
             detail: "Failure".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         assert!(cancel_job(&mut a));
         assert!(a.cancel.load(Ordering::Relaxed));
@@ -3096,6 +3279,7 @@ mod ui_state_tests {
             percent: 32,
             detail: "Downloading".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         let mut state = State {
             theme: "red".into(),
@@ -3134,6 +3318,7 @@ mod ui_state_tests {
             percent: 0,
             detail: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         assert!(is_pending_duplicate(
             &job,
@@ -3167,6 +3352,36 @@ mod ui_state_tests {
     }
 
     #[test]
+    fn pending_audio_and_captions_ignore_video_quality_in_both_queue_paths() {
+        let folder = PathBuf::from(r"C:\Downloads");
+        let target = video("abcdefghijk", "Target");
+        for mode in [Mode::Audio, Mode::Captions] {
+            let jobs = (0..200)
+                .map(|index| Job {
+                    video: if index == 0 {
+                        target.clone()
+                    } else {
+                        video(&format!("{index:011}"), "Unrelated")
+                    },
+                    mode,
+                    quality: "720".into(),
+                    folder: folder.clone(),
+                    status: JobState::Queued,
+                    percent: 0,
+                    detail: String::new(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    output_files: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let selected = jobs.iter().map(|job| job.video.clone()).collect();
+            assert!(
+                unqueued_videos(&jobs[..1], vec![target.clone()], mode, "1080", &folder).is_empty()
+            );
+            assert!(unqueued_videos(&jobs, selected, mode, "1080", &folder).is_empty());
+        }
+    }
+
+    #[test]
     fn queue_capacity_counts_only_new_jobs_after_duplicate_filtering() {
         let folder = PathBuf::from(r"C:\Downloads");
         let jobs = (0..store::MAX_JOBS - 1)
@@ -3183,6 +3398,7 @@ mod ui_state_tests {
                 percent: 0,
                 detail: String::new(),
                 cancel: Arc::new(AtomicBool::new(false)),
+                output_files: Vec::new(),
             })
             .collect::<Vec<_>>();
         let selected = vec![
@@ -3209,6 +3425,7 @@ mod ui_state_tests {
             percent: 30,
             detail: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         let selected = vec![
             video("abcdefghijk", "Existing"),
@@ -3233,6 +3450,7 @@ mod ui_state_tests {
             percent: 30,
             detail: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            output_files: Vec::new(),
         };
         for (mode, quality, destination, status) in [
             (Mode::Video, "1080", &folder, JobState::Active),
@@ -3264,6 +3482,7 @@ mod ui_state_tests {
                     percent: 0,
                     detail: String::new(),
                     cancel: Arc::new(AtomicBool::new(false)),
+                    output_files: Vec::new(),
                 })
                 .collect::<Vec<_>>();
             let selected = jobs.iter().map(|job| job.video.clone()).collect::<Vec<_>>();
@@ -3319,21 +3538,92 @@ mod ui_state_tests {
     }
 
     #[test]
+    fn direct_video_review_uses_only_the_link_without_replacing_channel_selection() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        let mut state = State {
+            videos: vec![(video("abcdefghijk", "Library selection"), true)],
+            ..State::default()
+        };
+        show_direct_video(&ui, &mut state, video("pqrstuvwxyz", "Pasted video"));
+        assert!(ui.get_direct_video_setup());
+        assert_eq!(ui.get_selected_items(), 1);
+        assert_eq!(
+            ui.get_selected_videos().row_data(0).unwrap().id,
+            "pqrstuvwxyz"
+        );
+        assert!(state.snapshot().videos[0].selected);
+        assert_eq!(state.snapshot().videos[0].video.id, "abcdefghijk");
+    }
+
+    #[test]
+    fn visible_thumbnail_ranges_prioritize_old_visible_rows_over_overscan() {
+        let rows = (0..240)
+            .map(|index| display_row(&format!("{index:011}"), "Upload", false))
+            .collect::<Vec<_>>();
+        let model = ModelRc::from(Rc::new(VecModel::from(rows)));
+        let expected = (225..228)
+            .chain(228..232)
+            .chain(223..225)
+            .map(|index| format!("{index:011}"))
+            .collect::<Vec<_>>();
+        assert_eq!(visible_thumbnail_ids(&model, 225, 3), expected);
+    }
+
+    #[test]
+    fn reveal_uses_an_existing_output_inside_the_download_folder() {
+        let parent = std::env::temp_dir().join(format!("ycd-reveal-{}", std::process::id()));
+        let folder = parent.join("chosen");
+        std::fs::create_dir_all(&folder).unwrap();
+        let outside = parent.join("outside.mp3");
+        let inside = folder.join("actual file.mp3");
+        std::fs::write(&outside, b"fixture").unwrap();
+        std::fs::write(&inside, b"fixture").unwrap();
+
+        let outputs = [folder.join("missing.srt"), outside, inside.clone()];
+        assert_eq!(
+            existing_download_output(&folder, &outputs),
+            Some(inside.canonicalize().unwrap())
+        );
+        assert!(existing_download_output(&folder, &outputs[..2]).is_none());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn sparse_channel_refresh_keeps_selected_rows_below_the_nominal_page_size() {
+        let first = video("abcdefghijk", "First");
+        let older = video("pqrstuvwxyz", "Older selection");
+        let cached = vec![(first.clone(), false), (older.clone(), true)];
+        let mut refreshed = reconcile_videos(&cached, vec![first], true);
+
+        retain_cached_channel_videos(&mut refreshed, cached);
+
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[1].0.id, older.id);
+        assert!(refreshed[1].1);
+    }
+
+    #[test]
     fn scrolling_pagination_advances_in_batches_and_stops_at_end() {
         let mut pages = ChannelPages::default();
-        pages.reset(200);
+        pages.restore(None, 200);
         assert_eq!(pages.next_start, 201);
         assert!(pages.available);
         pages.fetching = true;
-        pages.after_page(200, 400);
+        pages.after_page(201, true);
         assert_eq!(pages.next_start, 401);
         assert!(pages.available);
         assert!(!pages.fetching);
-        pages.after_page(58, 458);
+        pages.restore(Some(401), 193);
+        assert_eq!(pages.next_start, 401);
+        assert!(pages.available);
+        pages.after_page(401, false);
         assert!(!pages.available);
-        pages.reset(1_000);
+        pages.restore(Some(0), 458);
         assert!(!pages.available);
-        pages.reset(398);
+        pages.restore(None, 1_000);
+        assert!(!pages.available);
+        pages.restore(None, 398);
         assert_eq!(pages.next_start, 401);
     }
 

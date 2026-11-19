@@ -1,4 +1,4 @@
-use crate::engine::{channel_url, validate_id, Mode, Video, MAX_CHANNEL_VIDEOS};
+use crate::engine::{channel_url, validate_id, Mode, Video, CHANNEL_PAGE_SIZE, MAX_CHANNEL_VIDEOS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,6 +12,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_JOBS: usize = 1_000;
 pub const MAX_CHANNEL_HISTORY: usize = 64;
 pub const MAX_SAVED_CHANNELS: usize = 16;
+pub const MAX_OUTPUT_FILES: usize = 32;
+const MAX_OUTPUT_PATH_BYTES: usize = 4_096;
 // Accommodate a saved 1,000-video library plus bounded queue/history entries.
 const MAX_FILE_BYTES: u64 = 8_000_000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +59,8 @@ pub struct SavedJob {
     pub folder: PathBuf,
     pub state: SavedJobStatus,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +70,9 @@ pub struct SavedState {
     pub theme: String,
     pub channel_name: String,
     pub channel_url: String,
+    // Older sessions have no cursor. Zero records an exhausted channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_next_start: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_channel_history")]
     pub channel_history: Vec<SavedChannelHistory>,
     #[serde(default, deserialize_with = "deserialize_saved_channels")]
@@ -87,6 +94,13 @@ fn valid_video(video: &Video) -> bool {
         && !video.duration.chars().any(char::is_control)
         && video.uploaded.len() <= 30
         && !video.uploaded.chars().any(char::is_control)
+}
+
+pub fn valid_output_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|path| path.len() <= MAX_OUTPUT_PATH_BYTES)
 }
 
 fn valid_channel(name: &str, url: &str) -> bool {
@@ -155,6 +169,11 @@ impl SavedState {
             || !matches!(self.theme.as_str(), "red" | "mono")
             || self.channel_name.len() > 400
             || self.channel_url.len() > 2_048
+            || self.channel_next_start.is_some_and(|start| {
+                start != 0
+                    && (start > MAX_CHANNEL_VIDEOS
+                        || !(start - 1).is_multiple_of(CHANNEL_PAGE_SIZE))
+            })
             || self.channel_history.len() > MAX_CHANNEL_HISTORY
             || self.saved_channels.len() > MAX_SAVED_CHANNELS
             || self.videos.len() > MAX_CHANNEL_VIDEOS
@@ -188,6 +207,11 @@ impl SavedState {
                 !valid_video(&item.video)
                     || !item.folder.is_absolute()
                     || item.detail.len() > 500
+                    || item.output_files.len() > MAX_OUTPUT_FILES
+                    || item
+                        .output_files
+                        .iter()
+                        .any(|path| !valid_output_path(path))
                     || !matches!(item.quality.as_str(), "best" | "1080" | "720" | "360")
             })
         {
@@ -331,6 +355,7 @@ mod tests {
             theme: "red".into(),
             channel_name: "Test creator".into(),
             channel_url: "https://www.youtube.com/@TestCreator/videos".into(),
+            channel_next_start: None,
             channel_history: Vec::new(),
             saved_channels: Vec::new(),
             folder: PathBuf::from(r"C:\Downloads"),
@@ -345,6 +370,7 @@ mod tests {
                 folder: PathBuf::from(r"C:\Downloads"),
                 state: SavedJobStatus::Active,
                 detail: "Downloading…".into(),
+                output_files: Vec::new(),
             }],
         }
     }
@@ -485,6 +511,92 @@ mod tests {
         assert_eq!(loaded.saved_channels[0].name, "Saved good channel");
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_defaults_to_no_cursor_and_no_output_files() {
+        let dir = std::env::temp_dir().join(format!("ycd-legacy-session-{}", std::process::id()));
+        let path = dir.join("session.json");
+        fs::create_dir_all(&dir).unwrap();
+        let mut snapshot = sample();
+        snapshot.channel_next_start = Some(201);
+        snapshot.jobs[0].output_files = vec![snapshot.folder.join("caption.srt")];
+        let mut document = serde_json::to_value(snapshot).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("channel_next_start");
+        document["jobs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("output_files");
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let restored = load(&path).unwrap().unwrap();
+
+        assert_eq!(restored.channel_next_start, None);
+        assert!(restored.videos[0].selected);
+        assert_eq!(restored.jobs[0].state, SavedJobStatus::Queued);
+        assert!(restored.jobs[0].output_files.is_empty());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn page_cursor_and_completed_caption_paths_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ycd-output-session-{}", std::process::id()));
+        let path = dir.join("session.json");
+        let mut snapshot = sample();
+        let first = dir.join("missing.en.srt");
+        let second = dir.join("missing.en-US.srt");
+        snapshot.jobs[0].folder = dir.clone();
+        snapshot.jobs[0].mode = Mode::Captions;
+        snapshot.jobs[0].state = SavedJobStatus::Completed;
+        snapshot.jobs[0].output_files = vec![first.clone(), second.clone()];
+
+        for cursor in [Some(401), Some(0)] {
+            snapshot.channel_next_start = cursor;
+            save(&path, &snapshot).unwrap();
+            let restored = load(&path).unwrap().unwrap();
+            assert_eq!(restored.channel_next_start, cursor);
+            assert_eq!(
+                restored.jobs[0].output_files,
+                [first.clone(), second.clone()]
+            );
+        }
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_page_offsets_outside_the_supported_batches() {
+        let mut state = sample();
+        for start in [1, 201, 801] {
+            state.channel_next_start = Some(start);
+            state.validate().unwrap();
+        }
+        for start in [2, 200, 1_001, usize::MAX] {
+            state.channel_next_start = Some(start);
+            assert!(
+                state.validate().is_err(),
+                "accepted invalid page offset {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_relative_and_oversized_job_output_metadata() {
+        let mut state = sample();
+        state.jobs[0].output_files = vec![PathBuf::from("relative.srt")];
+        assert!(state.validate().is_err());
+
+        state.jobs[0].output_files = vec![state.folder.join("a".repeat(4_097))];
+        assert!(state.validate().is_err());
+
+        state.jobs[0].output_files = (0..33)
+            .map(|index| state.folder.join(format!("{index}.srt")))
+            .collect();
+        assert!(state.validate().is_err());
     }
 
     #[test]

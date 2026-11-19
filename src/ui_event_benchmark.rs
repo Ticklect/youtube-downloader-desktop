@@ -69,6 +69,7 @@ fn process_cpu_and_memory() -> (u64, usize) {
 fn sample_row(index: i32) -> TaskRow {
     TaskRow {
         job_index: index,
+        has_output: false,
         title: format!("Upload {index}").into(),
         title_long: false,
         detail: "Waiting  ·  1:30".into(),

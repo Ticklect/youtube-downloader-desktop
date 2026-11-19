@@ -937,42 +937,27 @@ try {
         }
     }
     if ($ExerciseSelectionPopup) {
+        # This switch also supports older callers of the setup review check.
         Add-Type -AssemblyName UIAutomationClient
         Add-Type -AssemblyName UIAutomationTypes
         $selectionRoot = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
-        $all = $selectionRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        $reviewButton = @($all | Where-Object { $_.Current.Name -eq 'Review videos' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' }) | Select-Object -First 1
-        if (-not $reviewButton) { throw 'Compact selection review button missing.' }
-        $reviewButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        $selectionVisible = $false
-        for ($attempt=0; $attempt -lt 18; $attempt++) {
-            Start-Sleep -Milliseconds 120
+        $visible = $false
+        for ($attempt = 0; $attempt -lt 18; $attempt++) {
             $items = $selectionRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
             $names = @($items | ForEach-Object { $_.Current.Name })
-            if ($names -contains 'SELECTED VIDEOS' -and @($names | Where-Object { $_ -like '*Rick Astley - Never Gonna Give You Up*' }).Count -gt 0) {
-                $selectionVisible = $true
+            $quality = @($items | Where-Object { $_.Current.Name -eq '720p' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' }) | Select-Object -First 1
+            $start = @($items | Where-Object { $_.Current.Name -like 'Start downloads*' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' }) | Select-Object -First 1
+            if ($names -contains 'Your selection' -and
+                $names -contains 'Rick Astley - Never Gonna Give You Up' -and
+                $quality -and $start -and $quality.Current.BoundingRectangle.Height -ge 30 -and
+                $quality.Current.BoundingRectangle.Bottom -lt $start.Current.BoundingRectangle.Top) {
+                $visible = $true
                 break
             }
-        }
-        if (-not $selectionVisible) { throw 'Review videos did not show complete selected-video names.' }
-        Write-Output 'GUI_SELECTION_REVIEW_PASS'
-        $closeButton = @($items | Where-Object { $_.Current.Name -eq 'Close' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' }) | Select-Object -First 1
-        if (-not $closeButton) { throw 'Review videos popup is missing a keyboard-accessible Close button.' }
-        $closeButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        $closed = $false
-        for ($attempt=0; $attempt -lt 18; $attempt++) {
             Start-Sleep -Milliseconds 120
-            $afterClose = $selectionRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-            if (@($afterClose | ForEach-Object { $_.Current.Name }) -notcontains 'SELECTED VIDEOS') {
-                $closed = $true; break
-            }
         }
-        if (-not $closed) { throw 'Review videos popup did not close.' }
-        Write-Output 'GUI_SELECTION_REVIEW_CLOSE_PASS'
-        $reviewAgain = @($afterClose | Where-Object { $_.Current.Name -eq 'Review videos' -and $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' }) | Select-Object -First 1
-        if (-not $reviewAgain) { throw 'Review videos button disappeared after closing popup.' }
-        $reviewAgain.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        Start-Sleep -Milliseconds 250
+        if (-not $visible) { throw 'The selected title and quality control are not visible together above Start downloads.' }
+        Write-Output 'GUI_SELECTION_REVIEW_PASS'
     }
     if ($CaptureHistoryConfirmation) {
         Add-Type -AssemblyName UIAutomationClient

@@ -13,6 +13,7 @@ pub const CHANNEL_PAGE_SIZE: usize = 200;
 pub const MAX_CHANNEL_VIDEOS: usize = 1_000;
 pub const MAX_SELECTED: usize = 1_000;
 pub const MAX_PARALLEL: usize = 3;
+const WATCH_URL_PREFIX: &str = "https://www.youtube.com/watch?v=";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Video {
@@ -47,6 +48,64 @@ pub fn validate_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+pub fn video_url(input: &str) -> Result<Option<String>, String> {
+    Ok(video_id(input)?.map(|id| format!("{WATCH_URL_PREFIX}{id}")))
+}
+
+fn video_id(input: &str) -> Result<Option<String>, String> {
+    let input = input.trim();
+    if input.is_empty() || input.len() > 2048 {
+        return Ok(None);
+    }
+    let expanded;
+    let address = if input.split_once('/').is_some_and(|(host, _)| {
+        [
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+        ]
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    }) {
+        expanded = format!("https://{input}");
+        expanded.as_str()
+    } else {
+        input
+    };
+    let Ok(url) = Url::parse(address) else {
+        return Ok(None);
+    };
+    let invalid = "Use a valid YouTube video or Shorts link.";
+    let path = url.path().trim_end_matches('/');
+    let id = match (url.host_str(), path) {
+        (Some("youtu.be"), path) => path.trim_start_matches('/').to_owned(),
+        (Some("www.youtube.com" | "youtube.com" | "m.youtube.com"), "/watch") => {
+            let mut values = url.query_pairs().filter(|(key, _)| key == "v");
+            let (_, value) = values.next().ok_or(invalid)?;
+            if values.next().is_some() {
+                return Err(invalid.into());
+            }
+            value.into_owned()
+        }
+        (Some("www.youtube.com" | "youtube.com" | "m.youtube.com"), path)
+            if path == "/shorts" || path.starts_with("/shorts/") =>
+        {
+            path.strip_prefix("/shorts/").unwrap_or("").to_owned()
+        }
+        _ => return Ok(None),
+    };
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !validate_id(&id)
+    {
+        return Err(invalid.into());
+    }
+    Ok(Some(id))
 }
 
 pub fn channel_url(input: &str) -> Result<String, String> {
@@ -114,10 +173,6 @@ pub fn channel_url(input: &str) -> Result<String, String> {
     ))
 }
 
-pub fn parse_channel_json(text: &str) -> Result<(String, Vec<Video>), String> {
-    parse_channel_page_json(text, false)
-}
-
 #[derive(Deserialize)]
 struct ChannelMetadata {
     #[serde(default)]
@@ -126,6 +181,8 @@ struct ChannelMetadata {
     title: Value,
     #[serde(default)]
     entries: Option<Vec<ChannelMetadataEntry>>,
+    #[serde(default)]
+    playlist_count: Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -138,6 +195,8 @@ struct ChannelMetadataFields {
     duration: Value,
     #[serde(default)]
     upload_date: Value,
+    #[serde(default)]
+    playlist_index: Value,
 }
 
 #[derive(Default)]
@@ -184,7 +243,39 @@ impl<'de> Deserialize<'de> for ChannelMetadataEntry {
     }
 }
 
-fn parse_channel_page_json(text: &str, allow_empty: bool) -> Result<(String, Vec<Video>), String> {
+fn video_from_metadata(entry: &ChannelMetadataFields) -> Option<Video> {
+    let id = entry.id.as_str().filter(|id| validate_id(id))?;
+    let title = entry.title.as_str().unwrap_or("Untitled video");
+    let title = title
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect();
+    let seconds = entry.duration.as_u64().or_else(|| {
+        entry
+            .duration
+            .as_f64()
+            .filter(|seconds| (0.0..u64::MAX as f64).contains(seconds))
+            .map(|seconds| seconds as u64)
+    });
+    let duration = seconds
+        .map(|s| format!("{}:{:02}", s / 60, s % 60))
+        .unwrap_or_else(|| "Duration unknown".into());
+    let uploaded = entry
+        .upload_date
+        .as_str()
+        .filter(|date| date.len() == 8 && date.bytes().all(|c| c.is_ascii_digit()))
+        .map(|date| format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]))
+        .unwrap_or_default();
+    Some(Video {
+        id: id.to_owned(),
+        title,
+        duration,
+        uploaded,
+    })
+}
+
+fn parse_channel_page_json(text: &str, start: usize) -> Result<(String, Vec<Video>, bool), String> {
     if text.len() > 12_000_000 {
         return Err("Channel metadata is unexpectedly large.".into());
     }
@@ -199,44 +290,33 @@ fn parse_channel_page_json(text: &str, allow_empty: bool) -> Result<(String, Vec
         .entries
         .as_deref()
         .ok_or("yt-dlp did not return a channel video list.")?;
+    let end = (start + CHANNEL_PAGE_SIZE - 1).min(MAX_CHANNEL_VIDEOS);
+    let mut more = end < MAX_CHANNEL_VIDEOS
+        && document
+            .playlist_count
+            .as_u64()
+            .is_some_and(|count| count > end as u64);
     let mut found = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for entry in entries.iter().take(CHANNEL_PAGE_SIZE * 2) {
+    for (index, entry) in entries.iter().take(CHANNEL_PAGE_SIZE + 1).enumerate() {
         let entry = &entry.0;
-        let id = entry.id.as_str().unwrap_or("");
-        if !validate_id(id) || !seen.insert(id.to_owned()) {
+        // The playlist index survives gaps when yt-dlp skips an entry. When
+        // it is absent, the raw position still counts duplicates and nulls.
+        let position = entry.playlist_index.as_u64().unwrap_or_default();
+        if position > end as u64 || start + index > end {
+            more |= end < MAX_CHANNEL_VIDEOS;
             continue;
         }
-        let title = entry.title.as_str().unwrap_or("Untitled video");
-        let title: String = title
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .take(200)
-            .collect();
-        let seconds = entry.duration.as_u64();
-        let duration = seconds
-            .map(|s| format!("{}:{:02}", s / 60, s % 60))
-            .unwrap_or_else(|| "Duration unknown".into());
-        let uploaded = entry
-            .upload_date
-            .as_str()
-            .filter(|date| date.len() == 8 && date.bytes().all(|c| c.is_ascii_digit()))
-            .map(|date| format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]))
-            .unwrap_or_default();
-        found.push(Video {
-            id: id.to_owned(),
-            title,
-            duration,
-            uploaded,
-        });
-        if found.len() >= CHANNEL_PAGE_SIZE {
-            break;
+        if let Some(video) =
+            video_from_metadata(entry).filter(|video| seen.insert(video.id.clone()))
+        {
+            found.push(video);
         }
     }
-    if found.is_empty() && !allow_empty {
+    if found.is_empty() && start == 1 && !more {
         return Err("No public videos were returned for this channel.".into());
     }
-    Ok((name.chars().take(100).collect(), found))
+    Ok((name.chars().take(100).collect(), found, more))
 }
 
 pub fn download_arguments(
@@ -321,48 +401,61 @@ pub fn download_arguments(
         }
         .into(),
     );
-    args.push(format!("https://www.youtube.com/watch?v={}", video.id));
+    args.push(format!("{WATCH_URL_PREFIX}{}", video.id));
     Ok(args)
 }
 
-fn is_saved_file_in_folder(path: &str, folder: &Path) -> bool {
-    let Ok(root) = folder.canonicalize() else {
-        return false;
+fn validate_download_output(
+    mode: Mode,
+    folder: &Path,
+    output: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let missing = match mode {
+        Mode::Captions => "No English captions were saved for this video.",
+        Mode::Video | Mode::Audio => "yt-dlp finished without saving the requested file.",
     };
-    let Ok(file) = Path::new(path).canonicalize() else {
-        return false;
+    let root = folder.canonicalize().map_err(|_| missing)?;
+    let mut saved = Vec::new();
+    let mut record = |path: &str| {
+        let Ok(file) = Path::new(path).canonicalize() else {
+            return;
+        };
+        if file.starts_with(&root)
+            && std::fs::metadata(&file).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+            && !saved.contains(&file)
+        {
+            saved.push(file);
+        }
     };
-    file.starts_with(root)
-        && std::fs::metadata(file).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-}
-
-fn validate_download_output(mode: Mode, folder: &Path, output: &str) -> Result<(), String> {
-    match mode {
-        Mode::Captions => {
-            let saved = output
-                .lines()
-                .filter_map(|line| line.strip_prefix("__YCD_CAPTIONS__"))
-                .filter_map(|json| serde_json::from_str::<Value>(json).ok())
-                .filter_map(|value| value.as_object().cloned())
-                .flat_map(|subtitles| subtitles.into_values())
-                .filter_map(|subtitle| subtitle["filepath"].as_str().map(str::to_owned))
-                .any(|path| is_saved_file_in_folder(&path, folder));
-            if !saved {
-                return Err("No English captions were saved for this video.".into());
+    if mode == Mode::Captions {
+        for line in output
+            .lines()
+            .filter_map(|line| line.strip_prefix("__YCD_CAPTIONS__"))
+        {
+            let Ok(captions) = serde_json::from_str::<serde_json::Map<String, Value>>(line) else {
+                continue;
+            };
+            for path in captions
+                .values()
+                .filter_map(|subtitle| subtitle["filepath"].as_str())
+            {
+                record(path);
             }
         }
-        Mode::Video | Mode::Audio => {
-            let saved = output
-                .lines()
-                .filter_map(|line| line.strip_prefix("__YCD_FILE__"))
-                .filter_map(|json| serde_json::from_str::<String>(json).ok())
-                .any(|path| is_saved_file_in_folder(&path, folder));
-            if !saved {
-                return Err("yt-dlp finished without saving the requested file.".into());
+    } else {
+        for line in output
+            .lines()
+            .filter_map(|line| line.strip_prefix("__YCD_FILE__"))
+        {
+            if let Ok(path) = serde_json::from_str::<String>(line) {
+                record(&path);
             }
         }
     }
-    Ok(())
+    if saved.is_empty() {
+        return Err(missing.into());
+    }
+    Ok(saved)
 }
 
 pub fn parse_percent(line: &str) -> Option<(i32, String)> {
@@ -424,7 +517,7 @@ pub fn find_dependency(file: &str) -> Result<PathBuf, String> {
     ))
 }
 
-pub fn load_channel(executable: &Path, url: &str) -> Result<(String, Vec<Video>), String> {
+pub fn load_channel(executable: &Path, url: &str) -> Result<(String, Vec<Video>, bool), String> {
     load_channel_page(executable, url, 1)
 }
 
@@ -432,9 +525,40 @@ pub fn load_channel_page(
     executable: &Path,
     url: &str,
     start: usize,
-) -> Result<(String, Vec<Video>), String> {
+) -> Result<(String, Vec<Video>, bool), String> {
     let (page_start, page_end) = channel_page_args(start)?;
     let url = channel_url(url)?;
+    let output = load_metadata(
+        executable,
+        &[
+            "--flat-playlist",
+            "--playlist-start",
+            &page_start,
+            "--playlist-end",
+            &page_end,
+            "--ignore-errors",
+            &url,
+        ],
+    )?;
+    parse_channel_page_json(&output, start)
+}
+
+pub fn load_video(executable: &Path, url: &str) -> Result<Video, String> {
+    let id = video_id(url)?.ok_or("Enter a YouTube video or Shorts link.")?;
+    let url = format!("{WATCH_URL_PREFIX}{id}");
+    let output = load_metadata(executable, &["--no-playlist", "--skip-download", &url])?;
+    parse_video_json(&output, &id)
+}
+
+fn parse_video_json(text: &str, expected_id: &str) -> Result<Video, String> {
+    let entry: ChannelMetadataFields = serde_json::from_str(text)
+        .map_err(|_| "yt-dlp returned unreadable video metadata.".to_owned())?;
+    video_from_metadata(&entry)
+        .filter(|video| video.id == expected_id)
+        .ok_or_else(|| "yt-dlp did not return metadata for this video.".into())
+}
+
+fn load_metadata(executable: &Path, args: &[&str]) -> Result<String, String> {
     let runtime = executable
         .parent()
         .ok_or("yt-dlp has no parent directory.")?
@@ -449,36 +573,20 @@ pub fn load_channel_page(
             "--ignore-config",
             "--js-runtimes",
             &runtime_arg,
-            "--flat-playlist",
             "--dump-single-json",
-            "--playlist-start",
-            &page_start,
-            "--playlist-end",
-            &page_end,
-            "--ignore-errors",
             "--no-warnings",
             "--socket-timeout",
             "12",
-            &url,
         ])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console(&mut command);
     let child = command
         .spawn()
         .map_err(|e| format!("Unable to launch yt-dlp: {e}"))?;
-    let output = run_bounded(child, Duration::from_secs(100), None, |_, _| {})?;
-    if !output.0 {
-        return Err(
-            "yt-dlp could not load the channel. Check the address and your network connection."
-                .into(),
-        );
-    }
-    if start == 1 {
-        parse_channel_json(&output.1)
-    } else {
-        parse_channel_page_json(&output.1, true)
-    }
+    let (_, output) = run_bounded(child, Duration::from_secs(100), None, |_, _| {})?;
+    Ok(output)
 }
 
 fn channel_page_args(start: usize) -> Result<(String, String), String> {
@@ -487,7 +595,8 @@ fn channel_page_args(start: usize) -> Result<(String, String), String> {
     }
     Ok((
         start.to_string(),
-        (start + CHANNEL_PAGE_SIZE - 1)
+        // Request one lookahead position, except at the 1,000-video cap.
+        (start + CHANNEL_PAGE_SIZE)
             .min(MAX_CHANNEL_VIDEOS)
             .to_string(),
     ))
@@ -777,7 +886,7 @@ pub fn download_video(
     spec: DownloadSpec<'_>,
     cancel: Arc<AtomicBool>,
     progress: impl Fn(i32, String) + Send + 'static,
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Download cancelled.".into());
     }
@@ -843,7 +952,7 @@ mod tests {
             let mut elapsed = Vec::with_capacity(iterations);
             for _ in 0..iterations {
                 let started = Instant::now();
-                let (_, videos) = parse_channel_page_json(&json, true).unwrap();
+                let (_, videos, _) = parse_channel_page_json(&json, 1).unwrap();
                 assert_eq!(videos.len(), count.min(200));
                 elapsed.push(started.elapsed().as_micros());
             }
@@ -1088,16 +1197,59 @@ mod tests {
     }
 
     #[test]
+    fn direct_video_links_keep_only_the_validated_id() {
+        let canonical = "https://www.youtube.com/watch?v=abcdefghijk";
+        for input in [
+            "https://www.youtube.com/watch?v=abcdefghijk&list=PLexample&t=42",
+            " https://youtu.be/abcdefghijk?si=example ",
+            "https://m.youtube.com/shorts/abcdefghijk?feature=share",
+            "www.YouTube.com/shorts/abcdefghijk/",
+        ] {
+            assert_eq!(video_url(input).unwrap().as_deref(), Some(canonical));
+        }
+        for input in [
+            "https://youtube.com/watch?list=PLexample",
+            "https://youtube.com/watch?v=abcdefghijk&v=zyxwvutsrqp",
+            "https://youtu.be/abcdefghijk/extra",
+            "https://youtube.com/shorts/invalid",
+            "https://name@youtu.be/abcdefghijk",
+            "https://youtu.be:444/abcdefghijk",
+            "http://youtube.com/watch?v=abcdefghijk",
+        ] {
+            assert!(video_url(input).is_err(), "{input}");
+        }
+        for input in [
+            "@creator",
+            "https://youtube.com/@creator",
+            "https://youtube.com.evil.test/watch?v=abcdefghijk",
+        ] {
+            assert_eq!(video_url(input).unwrap(), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn direct_video_metadata_must_match_the_requested_id() {
+        let input = r#"{"id":"abcdefghijk","title":"A Shorts title","duration":31.5,"upload_date":"20261119"}"#;
+        let video = parse_video_json(input, "abcdefghijk").unwrap();
+        assert_eq!(video.title, "A Shorts title");
+        assert_eq!(video.duration, "0:31");
+        assert_eq!(video.uploaded, "2026-11-19");
+        assert!(parse_video_json(input, "zyxwvutsrqp").is_err());
+        assert!(parse_video_json(r#"{"entries":[]}"#, "abcdefghijk").is_err());
+    }
+
+    #[test]
     fn parser_handles_missing_and_duplicate_entries() {
         let input = r#"{"channel":"My channel","entries":[{"id":"abcdefghijk","title":"First","duration":65},{"id":"abcdefghijk","title":"duplicate"},{"id":"bad","title":"invalid"},{"id":"___________","title":"Second"}]}"#;
-        let (name, videos) = parse_channel_json(input).unwrap();
+        let (name, videos, more) = parse_channel_page_json(input, 1).unwrap();
         assert_eq!(name, "My channel");
         assert_eq!(videos.len(), 2);
         assert_eq!(videos[0].duration, "1:05");
-        assert!(parse_channel_json("not JSON").is_err());
-        assert!(parse_channel_json(r#"{"channel":"Empty","entries":[]}"#).is_err());
+        assert!(!more);
+        assert!(parse_channel_page_json("not JSON", 1).is_err());
+        assert!(parse_channel_page_json(r#"{"channel":"Empty","entries":[]}"#, 1).is_err());
         assert_eq!(
-            parse_channel_page_json(r#"{"channel":"Empty","entries":[]}"#, true)
+            parse_channel_page_json(r#"{"channel":"Empty","entries":[]}"#, 201)
                 .unwrap()
                 .1
                 .len(),
@@ -1108,7 +1260,7 @@ mod tests {
             r#"{"channel":"Null","entries":null}"#,
         ] {
             assert_eq!(
-                parse_channel_page_json(input, true).unwrap_err(),
+                parse_channel_page_json(input, 201).unwrap_err(),
                 "yt-dlp did not return a channel video list."
             );
         }
@@ -1120,7 +1272,7 @@ mod tests {
         {"id":"abcdefghijk","title":23,"duration":"bad","upload_date":false,"unused":{"large":["nested","discarded"]}},
         {"id":"pqrstuvwxyz","title":"Preserved","duration":60,"upload_date":"20261029","unused":{"metadata":[1,2,3]}},
         {"id":"abcdefghijk","title":"Duplicate"}]}"#;
-        let (name, videos) = parse_channel_page_json(source, false).unwrap();
+        let (name, videos, _) = parse_channel_page_json(source, 1).unwrap();
         assert_eq!(name, "Fallback title");
         assert_eq!(videos.len(), 2);
         assert_eq!(videos[0].title, "Untitled video");
@@ -1131,11 +1283,38 @@ mod tests {
     }
 
     #[test]
+    fn page_lookahead_uses_raw_positions_even_when_videos_are_skipped() {
+        let input = r#"{"entries":[null,{"id":"abcdefghijk","playlist_index":202},{"id":"abcdefghijk","playlist_index":399},{"id":"zyxwvutsrqp","playlist_index":401}]}"#;
+        let (_, videos, more) = parse_channel_page_json(input, 201).unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].id, "abcdefghijk");
+        assert!(more);
+
+        let exact_end = serde_json::json!({"entries": (1..=200).map(|index| {
+            serde_json::json!({"id": format!("{index:011}")})
+        }).collect::<Vec<_>>()});
+        let (_, videos, more) = parse_channel_page_json(&exact_end.to_string(), 1).unwrap();
+        assert_eq!(videos.len(), 200);
+        assert!(!more);
+
+        let filtered = serde_json::json!({"entries": vec![Value::Null; CHANNEL_PAGE_SIZE + 1]});
+        let (_, videos, more) = parse_channel_page_json(&filtered.to_string(), 1).unwrap();
+        assert!(videos.is_empty());
+        assert!(more);
+
+        let capped = r#"{"playlist_count":1001,"entries":[{"id":"abcdefghijk","playlist_index":1000},{"id":"zyxwvutsrqp","playlist_index":1001}]}"#;
+        let (_, videos, more) = parse_channel_page_json(capped, 801).unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].id, "abcdefghijk");
+        assert!(!more);
+    }
+
+    #[test]
     fn later_pages_use_distinct_bounded_playlist_ranges() {
-        assert_eq!(channel_page_args(1).unwrap(), ("1".into(), "200".into()));
+        assert_eq!(channel_page_args(1).unwrap(), ("1".into(), "201".into()));
         assert_eq!(
             channel_page_args(201).unwrap(),
-            ("201".into(), "400".into())
+            ("201".into(), "401".into())
         );
         assert_eq!(
             channel_page_args(801).unwrap(),
@@ -1211,8 +1390,15 @@ mod tests {
         let folder = executable.parent().unwrap();
         let quoted_path = serde_json::to_string(&executable.to_string_lossy()).unwrap();
         let file_result = format!("__YCD_FILE__{quoted_path}\n");
-        assert!(validate_download_output(Mode::Video, folder, &file_result).is_ok());
-        assert!(validate_download_output(Mode::Audio, folder, &file_result).is_ok());
+        let expected = vec![executable.canonicalize().unwrap()];
+        assert_eq!(
+            validate_download_output(Mode::Video, folder, &file_result.repeat(2)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            validate_download_output(Mode::Audio, folder, &file_result).unwrap(),
+            expected
+        );
 
         let missing_path = executable.with_extension("definitely-not-a-file");
         let missing = format!(
@@ -1223,9 +1409,50 @@ mod tests {
         assert!(validate_download_output(Mode::Video, folder, "").is_err());
 
         let captions = format!("__YCD_CAPTIONS__{{\"en\":{{\"filepath\":{quoted_path}}}}}");
-        assert!(validate_download_output(Mode::Captions, folder, &captions).is_ok());
+        assert_eq!(
+            validate_download_output(Mode::Captions, folder, &captions).unwrap(),
+            expected
+        );
         assert!(validate_download_output(Mode::Captions, folder, "__YCD_CAPTIONS__NA").is_err());
         assert!(validate_download_output(Mode::Captions, folder, "__YCD_CAPTIONS__{}").is_err());
+    }
+
+    #[test]
+    fn reports_all_saved_caption_files_and_rejects_outside_paths() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder =
+            std::env::temp_dir().join(format!("ycd-caption-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&folder).unwrap();
+        let en = folder.join("Test video.en.vtt");
+        let en_gb = folder.join("Test video.en-GB.vtt");
+        for file in [&en, &en_gb] {
+            std::fs::write(file, "WEBVTT\n").unwrap();
+        }
+        let output = serde_json::json!({
+            "en": {"filepath": en},
+            "en-GB": {"filepath": en_gb},
+            "en-orig": {"filepath": en},
+            "en-US": {"filepath": folder.join("missing.vtt")},
+            "eng": {"filepath": std::env::current_exe().unwrap()}
+        });
+        let expected = [en.canonicalize().unwrap(), en_gb.canonicalize().unwrap()];
+        let saved = validate_download_output(
+            Mode::Captions,
+            &folder,
+            &format!("__YCD_CAPTIONS__{output}"),
+        );
+        for file in [&en, &en_gb] {
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::remove_dir(&folder).unwrap();
+        let saved = saved.unwrap();
+        assert_eq!(saved.len(), 2);
+        for file in expected {
+            assert!(saved.contains(&file));
+        }
     }
 
     #[test]
